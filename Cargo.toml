@@ -1,0 +1,18 @@
+[package]
+name = "shim-interface-core"
+version = "0.1.0"
+edition = "2021"
+description = "Library: extract a DataFission wasm shim's SQL surface into a SQLite database. Consumed by per-shim binary crates (postgis-shim-interface, mobilitydb-shim-interface) and by downstream bridge-gen tooling (sqlink / ducklink)."
+license = "Apache-2.0"
+
+[dependencies]
+datafission-df-plugin-api = { path = "../datafission/crates/df-plugin-api" }
+datafission-df-plugin-loader = { path = "../datafission/crates/df-plugin-loader" }
+datafission-functions = { path = "../datafission/crates/functions" }
+datafission-index = { path = "../datafission/crates/index" }
+
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+blake3 = "1"
