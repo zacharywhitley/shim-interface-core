@@ -25,6 +25,20 @@ CREATE TABLE IF NOT EXISTS scalars (
     PRIMARY KEY (extension, name)
 );
 
+-- Scalar function aliases.
+--
+-- Doctrine note (2026-06-23 investigation): scalar shims expose
+-- aliases two ways. PostGIS uses `ScalarFunctionDef::aliases()`,
+-- returning a non-empty Vec from one canonical impl — those
+-- rows land here. MobilityDB instead pushes each alias as its
+-- own canonical `(name, Kind)` dispatch-table entry; its
+-- `aliases()` returns empty, so this table is empty for that
+-- shim (all 1548 mobilitydb scalars sit in `scalars` only,
+-- including its ~275 internal aliases). Both choices are
+-- correct against the trait — the difference is bookkeeping
+-- shape, not behavior. Tooling computing "total function
+-- names" should sum `scalars.count + scalar_aliases.count` to
+-- be fair across both shapes.
 CREATE TABLE IF NOT EXISTS scalar_aliases (
     extension TEXT NOT NULL,
     canonical TEXT NOT NULL,
@@ -126,10 +140,28 @@ CREATE TABLE IF NOT EXISTS system_catalog_tables (
     PRIMARY KEY (extension, catalog_name, table_name)
 );
 
+-- Spatial-index implementations.
+--
+-- TWO sources feed this table:
+--   1. `index-plugin/index@1.0.0` — per-extension callback,
+--      surfaces through `ExtensionTarget::register_index_builder`.
+--      `type_id` is the WIT-declared id; `capabilities_json` is
+--      null because that interface doesn't carry capability flags.
+--   2. `spatial-index-plugin/spatial-index@1.0.0` — process-
+--      global, surfaces through `extract_spatial_index_metadata`.
+--      `type_id` is 0 (sentinel — that interface doesn't expose
+--      ids, it routes by alias); `capabilities_json` carries
+--      `{knn, within_distance, within_distance_wkb,
+--      update_after_build}` booleans.
+--
+-- PostGIS uses path #2 exclusively; MobilityDB uses #1 (its
+-- stindex). The 2026-06-23 investigation found that without
+-- the path-#2 drain, PostGIS extractions reported zero indexes.
 CREATE TABLE IF NOT EXISTS spatial_indexes (
     extension TEXT NOT NULL,
     name TEXT NOT NULL,
     type_id INTEGER NOT NULL,
+    capabilities_json TEXT,
     PRIMARY KEY (extension, name)
 );
 

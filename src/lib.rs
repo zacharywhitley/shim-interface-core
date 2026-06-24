@@ -99,6 +99,37 @@ pub fn extract_shim(conn: &SharedConn, wasm_path: &Path) -> Result<ExtractedSumm
     insert_casts(&c, &name, &casts)?;
     insert_operators(&c, &name, &operators)?;
     insert_preprocessors(&c, &name, &preprocessors)?;
+    drop(c);
+
+    // Drain the spatial-index-plugin/spatial-index@1.0.0 interface
+    // — PostGIS publishes its spatial-index here (process-global)
+    // rather than through the per-extension index-plugin callback
+    // that ExtensionTarget::register_index_builder consumes. Without
+    // this drain, PostGIS extractions reported `spatial_indexes = 0`
+    // even though the shim has a working spatial index.
+    if let Ok(Some(meta)) = ext.extract_spatial_index_metadata() {
+        let caps = serde_json::json!({
+            "knn": meta.capabilities.knn,
+            "within_distance": meta.capabilities.within_distance,
+            "within_distance_wkb": meta.capabilities.within_distance_wkb,
+            "update_after_build": meta.capabilities.update_after_build,
+        }).to_string();
+        let c = conn.borrow();
+        // One row per alias the shim publishes; type_id is 0
+        // because the spatial-index interface routes by alias,
+        // not by stable id.
+        for alias in &meta.aliases {
+            let _ = c.execute(
+                "INSERT OR IGNORE INTO spatial_indexes \
+                 (extension, name, type_id, capabilities_json) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![name, alias, 0i64, caps],
+            );
+        }
+        let _ = (meta.name,);  // index "registry name" (e.g. "postgis-rtree")
+                               // captured in capabilities_json discussion; the
+                               // alias column is what callers query by.
+    }
 
     Ok(ExtractedSummary { name, version, blake3 })
 }
