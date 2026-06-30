@@ -243,6 +243,25 @@ impl ExtensionTarget for SqliteExtensionTarget {
         let cfg_idx = serde_json::to_string(&def.config_arg_indices())
             .unwrap_or_else(|_| "[]".into());
         let name = def.name().to_string();
+        // Skip if the same SQL name was already registered as a window
+        // function. Some upstream shims (e.g. PostGIS' st_clusterdbscan)
+        // declare a function under both the aggregate and window slots,
+        // but only the window shape has a matching WIT export. Letting
+        // the aggregate row through produces spurious "no WIT aggregate"
+        // warnings in codegen. Window wins.
+        {
+            let c = self.conn.borrow();
+            let already_window: bool = c
+                .query_row(
+                    "SELECT 1 FROM window_functions WHERE extension = ?1 AND name = ?2",
+                    params![self.extension, name],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if already_window {
+                return Ok(());
+            }
+        }
         let _ = self.conn.borrow().execute(
             "INSERT OR IGNORE INTO aggregates \
              (extension, name, param_types_json, supports_grouped, supports_partial, \
@@ -318,6 +337,18 @@ impl ExtensionTarget for SqliteExtensionTarget {
                 params![self.extension, name, alias],
             );
         }
+        // If the same SQL name was previously registered as an aggregate
+        // (registration order is shim-defined), drop the aggregate row so
+        // codegen sees a single canonical kind for this function. See
+        // register_aggregate_function for the inverse-order case.
+        let _ = self.conn.borrow().execute(
+            "DELETE FROM aggregates WHERE extension = ?1 AND name = ?2",
+            params![self.extension, name],
+        );
+        let _ = self.conn.borrow().execute(
+            "DELETE FROM aggregate_aliases WHERE extension = ?1 AND canonical = ?2",
+            params![self.extension, name],
+        );
         Ok(())
     }
 
