@@ -122,13 +122,25 @@ CREATE TABLE IF NOT EXISTS cast_rewrites (
     source_kind TEXT NOT NULL,
     function_name TEXT NOT NULL,
     source_fn_hint TEXT NOT NULL,
-    -- `source_fn_hint` is part of the PK so distinct source-side
-    -- rewrites that share a (target_type, source_kind) key don't
-    -- collide under `INSERT OR IGNORE`. PostGIS advertises many
-    -- casts that discriminate by the source-side function (e.g.
-    -- box2d::geometry vs. box3d::geometry, both under `any`); the
-    -- previous PK dropped ~17 of PostGIS' 39 cast rewrites (#788).
-    PRIMARY KEY (extension, target_type, source_kind, source_fn_hint)
+    -- Extension-namespaced source-side type id (or 0 when the
+    -- source shape is not discriminated by type — e.g. bytea-fed
+    -- `st_geomfromwkb` accepts any bit pattern). Populated from the
+    -- WIT-side `cast-rewrite.source-type-id` field (#798).
+    source_type_id INTEGER NOT NULL DEFAULT 0,
+    -- `source_fn_hint` and `source_type_id` are part of the PK so
+    -- distinct source-side rewrites that share a (target_type,
+    -- source_kind) key don't collide under `INSERT OR IGNORE`.
+    -- PostGIS advertises many casts that discriminate by the
+    -- source-side function (box2d::geometry vs. box3d::geometry,
+    -- both under `any`) — those separate via `source_fn_hint`. It
+    -- also advertises identity + PostgreSQL-native + topogeom +
+    -- raster rewrites that all target `geometry` under
+    -- `(source_kind=any, source_fn_hint="")`; those separate via
+    -- `source_type_id`. Before #798 the narrower PK dropped 7 of
+    -- PostGIS' 39 cast rewrites at INSERT OR IGNORE time; #788
+    -- had already caught the source_fn_hint axis but the
+    -- source-side type-id axis needed adding.
+    PRIMARY KEY (extension, target_type, source_kind, source_fn_hint, source_type_id)
 );
 
 CREATE TABLE IF NOT EXISTS preprocessor_patterns (

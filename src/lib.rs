@@ -484,12 +484,22 @@ impl ExtensionTarget for SqliteExtensionTarget {
 
 fn insert_casts(conn: &Connection, extension: &str, casts: &[ExtractedCast]) -> Result<()> {
     for c in casts {
+        // `source_type_id` maps `Option<u32>::None` to the sentinel
+        // 0 so the PK column can stay NOT NULL (`NULL`-in-PK rows
+        // would be treated as distinct by SQLite, which defeats the
+        // dedup guarantee `INSERT OR IGNORE` gives us).
+        let source_type_id = c.source_type_id.unwrap_or(0) as i64;
         conn.execute(
             "INSERT OR IGNORE INTO cast_rewrites \
-             (extension, target_type, source_kind, function_name, source_fn_hint) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (extension, target_type, source_kind, function_name, source_fn_hint, source_type_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                extension, c.target_type, c.source_kind, c.function_name, c.source_fn_hint
+                extension,
+                c.target_type,
+                c.source_kind,
+                c.function_name,
+                c.source_fn_hint,
+                source_type_id,
             ],
         )?;
     }
