@@ -26,7 +26,8 @@ use datafission_df_plugin_api::{
     SystemCatalogProvider, SystemTable,
 };
 use datafission_df_plugin_loader::{
-    ExtractedCast, ExtractedOperator, ExtractedPreprocessor, RuntimeWasmExtension,
+    extract_postgis_metadata_from_plug, ExtractedCast, ExtractedOperator,
+    ExtractedPreprocessor, PostgisMetadataSnapshot, RuntimeWasmExtension,
     SqlMetadataSnapshot,
 };
 use datafission_functions::traits::{
@@ -132,6 +133,68 @@ pub fn extract_shim(conn: &SharedConn, wasm_path: &Path) -> Result<ExtractedSumm
     }
 
     Ok(ExtractedSummary { name, version, blake3 })
+}
+
+/// Drain the raw `postgis-composed.wasm` plug's
+/// `postgis:wasm/postgis-metadata@0.1.0` surface (#784) into the
+/// same `cast_rewrites` / `operators` / `preprocessor_patterns`
+/// tables that `extract_shim` populates from
+/// `datafission:sql-extension-plugin/metadata`.
+///
+/// PostGIS #788 — the datafission postgis bridge implements
+/// `sql-extension-plugin/metadata` by returning `Ok(Vec::new())`
+/// for all three lists (its custom-type registration path is
+/// where PostGIS' rewrite tables would normally get seeded).
+/// The `postgis:wasm/postgis-metadata` surface on the raw plug
+/// carries the real 39/43/5 cast/operator/preprocessor tables,
+/// but `wac plug` hides plug exports so the composed shim can't
+/// re-expose them. Extractors therefore need to drain from the
+/// plug wasm alongside the shim wasm; that's what this function
+/// does.
+///
+/// Rows are attributed to `extension_name` (typically `"postgis"`)
+/// so downstream `cast_rewrites` queries by extension name still
+/// work identically. `plug_wasm_path` is the raw plug, e.g.
+/// `<datafission>/extensions/postgis/deps/postgis-composed.wasm`.
+///
+/// Returns `Ok(None)` when the plug wasm doesn't export
+/// `postgis:wasm/postgis-metadata@0.1.0` (older pins predating
+/// #784). Callers should treat that as "no metadata to drain".
+pub fn drain_postgis_metadata(
+    conn: &SharedConn,
+    extension_name: &str,
+    plug_wasm_path: &Path,
+) -> Result<Option<PostgisMetadataCounts>> {
+    let abs = plug_wasm_path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing {}", plug_wasm_path.display()))?;
+    let snap = extract_postgis_metadata_from_plug(&abs)
+        .map_err(|e| anyhow!("extract_postgis_metadata_from_plug({}): {e}", abs.display()))?;
+    let Some(PostgisMetadataSnapshot { casts, operators, preprocessors }) = snap else {
+        return Ok(None);
+    };
+    let counts = PostgisMetadataCounts {
+        casts: casts.len(),
+        operators: operators.len(),
+        preprocessors: preprocessors.len(),
+    };
+    let c = conn.borrow();
+    insert_casts(&c, extension_name, &casts)?;
+    insert_operators(&c, extension_name, &operators)?;
+    insert_preprocessors(&c, extension_name, &preprocessors)?;
+    drop(c);
+    Ok(Some(counts))
+}
+
+/// Per-list row counts returned by [`drain_postgis_metadata`],
+/// intended for the per-shim binary's `--summary` output so a
+/// human running the extraction can spot-check that #784's
+/// 39/43/5 tables actually landed.
+#[derive(Debug, Clone, Copy)]
+pub struct PostgisMetadataCounts {
+    pub casts: usize,
+    pub operators: usize,
+    pub preprocessors: usize,
 }
 
 /// Print a per-extension count summary to stdout. Useful for

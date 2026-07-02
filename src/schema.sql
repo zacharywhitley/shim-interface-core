@@ -122,7 +122,13 @@ CREATE TABLE IF NOT EXISTS cast_rewrites (
     source_kind TEXT NOT NULL,
     function_name TEXT NOT NULL,
     source_fn_hint TEXT NOT NULL,
-    PRIMARY KEY (extension, target_type, source_kind)
+    -- `source_fn_hint` is part of the PK so distinct source-side
+    -- rewrites that share a (target_type, source_kind) key don't
+    -- collide under `INSERT OR IGNORE`. PostGIS advertises many
+    -- casts that discriminate by the source-side function (e.g.
+    -- box2d::geometry vs. box3d::geometry, both under `any`); the
+    -- previous PK dropped ~17 of PostGIS' 39 cast rewrites (#788).
+    PRIMARY KEY (extension, target_type, source_kind, source_fn_hint)
 );
 
 CREATE TABLE IF NOT EXISTS preprocessor_patterns (
