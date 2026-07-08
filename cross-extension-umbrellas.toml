@@ -1,0 +1,88 @@
+# cross-extension-umbrellas.toml
+#
+# Umbrellas that span more than one shim-interface catalog.
+#
+# Each per-extension shim-interface repo owns its own
+# `leaves.toml` and per-extension umbrellas; this file owns the
+# umbrellas whose `expands_to` set reaches into multiple
+# extensions and therefore cannot be validated in isolation by
+# the per-extension `spatial-catalog-emit` binary.
+#
+# Schema
+# ------
+# The TOML shape mirrors the per-extension `leaves.toml`
+# umbrella entries with two extensions:
+#
+#   1. `expands_to` entries may be `<extension>:<leaf-or-umbrella>`
+#      qualified references (e.g. `postgis:spatio`,
+#      `mobilitydb:mobilitydb_spatiotemporal_core`). Bare
+#      identifiers (no colon) refer to an umbrella defined in
+#      this file itself.
+#   2. A top-level `extension = "cross"` marker distinguishes
+#      cross-extension umbrellas from per-extension ones when a
+#      multi-catalog consumer merges everything into one namespace.
+#
+# Consumption
+# -----------
+# The current single-extension `spatial-catalog-emit` binary does
+# not read this file. A future multi-extension consumer will merge
+# per-extension `spatial-catalog.toml` outputs with this file and
+# validate cross-extension leaf references; today this file is
+# authored as a design contract that future tooling will realise.
+#
+# Rationale (why this file, not tool changes or duplication)
+# ---------------------------------------------------------
+# Approach chosen: **(b) cross-extension file consumed by a future
+# tool subcommand**. The alternatives were rejected as follows:
+#
+#   (a) Extend the emitter to accept multiple `--db` +
+#       `--hypothesis` pairs. Coupling multi-extension state into
+#       every per-extension emit path breaks the emitter's clean
+#       "one DB → one catalog" contract; nothing in the current
+#       postgis-only or mobilitydb-only pipelines benefits.
+#   (c) Duplicate the cross-extension umbrella definitions inside
+#       each per-extension `leaves.toml`. The current emitter
+#       silently drops unknown-namespace refs; a duplicated def
+#       drifts. Kept as neither maintainable nor validatable.
+#
+# Option (b) keeps per-extension autonomy, single source of truth
+# for each cross-extension umbrella, and no code churn today.
+
+schema_version = "1"
+extension      = "cross"
+
+# ----- Capability axis (cross-extension) -----
+
+[[umbrella]]
+id          = "spatiotemporal"
+description = "Full static-spatial surface + non-spatial temporal core + MobilityDB spatiotemporal surface + trajectory analysis. The union of `postgis:spatio`, `mobilitydb:mobilitydb_temporal_core`, `mobilitydb:mobilitydb_spatiotemporal_core`, and `mobilitydb:temporal-analysis`. Everything a mobility application needs to represent, transform, and reason over moving geometries."
+expands_to  = [
+    "postgis:spatio",
+    "mobilitydb:mobilitydb_temporal_core",
+    "mobilitydb:mobilitydb_spatiotemporal_core",
+    "mobilitydb:temporal-analysis",
+]
+
+# ----- Task axis (cross-extension) -----
+
+[[umbrella]]
+id          = "mobility-analysis"
+description = "Trajectory-analysis job — the spatiotemporal capability surface plus MobilityDB's spatial-reasoning helpers (DBSCAN / KMeans clustering, spatiotemporal indexes, table-returning as-of / nearest / temporal-joins) and the temporal-analysis similarity kit."
+expands_to  = [
+    "spatiotemporal",
+    "mobilitydb:temporal-analysis",
+    "mobilitydb:mobilitydb_spatial_analysis",
+]
+
+# ----- Backwards-compat aliases (cross-extension) -----
+
+[[umbrella]]
+id          = "mobilitydb"
+description = "Cross-extension backwards-compat alias for the monolithic `LOAD mobilitydb` surface — every MobilityDB leaf plus the underlying `postgis:spatio` surface it depends on. Equivalent to `spatiotemporal` extended with the MobilityDB I/O parsers, bitemporal surface, and residual `mobilitydb_misc` leaf. The per-extension `mobilitydb` alias in `mobilitydb-shim-interface/leaves-mobilitydb.toml` covers the same leaves *without* the `postgis:*` prefix; use whichever matches your consumer's loading model."
+expands_to  = [
+    "spatiotemporal",
+    "mobilitydb:mobilitydb_io",
+    "mobilitydb:mobilitydb_bitemporal",
+    "mobilitydb:mobilitydb_temporal_jsonb",
+    "mobilitydb:mobilitydb_misc",
+]
