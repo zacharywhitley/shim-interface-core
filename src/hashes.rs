@@ -138,6 +138,140 @@ fn simple_fn_signature_hash(kind: &str, t: &SimpleFnSig<'_>) -> String {
     blake3::hash(&bytes).to_hex().to_string()
 }
 
+// ---------------------------------------------------------------------------
+// B4 (2026-07-09): signature hashes for the five non-function
+// catalog tables. No `implementation_hash` counterpart — types /
+// operators / casts / spatial indexes / preprocessor patterns
+// don't map to a source module; the signature IS the identity.
+//
+// Each hash is prefixed with the kind tag so a
+// `blake3sum <<< '<json>'` reproduction from the CLI still
+// distinguishes rows of different kinds that happen to share
+// their identifying columns.
+// ---------------------------------------------------------------------------
+
+/// A column-type row's SQL-visible identity: type name, storage
+/// size, and cast_from / cast_to JSON payloads.
+pub struct ColumnTypeSig<'a> {
+    pub type_name: &'a str,
+    pub storage_size: i64,
+    pub cast_from_json: &'a str,
+    pub cast_to_json: &'a str,
+}
+pub fn column_type_signature_hash(t: &ColumnTypeSig<'_>) -> String {
+    let bytes = canonical_json_bytes(&[
+        Value::String("column_type".to_string()),
+        Value::String(t.type_name.to_string()),
+        Value::Number(t.storage_size.into()),
+        recanonicalize_json_str(t.cast_from_json),
+        recanonicalize_json_str(t.cast_to_json),
+    ])
+    .expect("signature json is finite");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// An operator's SQL-visible identity: infix symbol, both side
+/// type ids (nullable) and the backing SQL function name. There
+/// is no separate `result_type` column in the shim-interface
+/// catalog yet; when one lands, extend the tuple here rather
+/// than folding it into `backing_function`.
+pub struct OperatorSig<'a> {
+    pub symbol: &'a str,
+    pub lhs_type_id: Option<i64>,
+    pub rhs_type_id: Option<i64>,
+    pub backing_function: &'a str,
+}
+pub fn operator_signature_hash(o: &OperatorSig<'_>) -> String {
+    let lhs = match o.lhs_type_id {
+        Some(n) => Value::Number(n.into()),
+        None => Value::Null,
+    };
+    let rhs = match o.rhs_type_id {
+        Some(n) => Value::Number(n.into()),
+        None => Value::Null,
+    };
+    let bytes = canonical_json_bytes(&[
+        Value::String("operator".to_string()),
+        Value::String(o.symbol.to_string()),
+        lhs,
+        rhs,
+        Value::String(o.backing_function.to_string()),
+    ])
+    .expect("signature json is finite");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// A cast-rewrite row's SQL-visible identity: `source_type_id`,
+/// target type name, source-kind discriminant, and the rewrite
+/// target (backing SQL function). `source_fn_hint` is folded in
+/// as an extension of the source-side discriminant so casts that
+/// share a `(target, source_kind, source_type_id)` but differ in
+/// their source-side function still get distinct hashes.
+pub struct CastRewriteSig<'a> {
+    pub source_type_id: i64,
+    pub target_type: &'a str,
+    pub source_kind: &'a str,
+    pub source_fn_hint: &'a str,
+    pub rewrite_target: &'a str,
+}
+pub fn cast_rewrite_signature_hash(c: &CastRewriteSig<'_>) -> String {
+    let bytes = canonical_json_bytes(&[
+        Value::String("cast_rewrite".to_string()),
+        Value::Number(c.source_type_id.into()),
+        Value::String(c.target_type.to_string()),
+        Value::String(c.source_kind.to_string()),
+        Value::String(c.source_fn_hint.to_string()),
+        Value::String(c.rewrite_target.to_string()),
+    ])
+    .expect("signature json is finite");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// A spatial-index row's SQL-visible identity: the shim-side
+/// method name (used as the `name` PK column) plus the
+/// capabilities JSON blob (which surfaces the supported
+/// operators / KNN / within-distance flags). The task-side
+/// name for the JSON is `supported_types_json`; the catalog
+/// column is `capabilities_json` — they're the same payload.
+pub struct SpatialIndexSig<'a> {
+    pub method: &'a str,
+    pub capabilities_json: &'a str,
+}
+pub fn spatial_index_signature_hash(s: &SpatialIndexSig<'_>) -> String {
+    // `capabilities_json` is nullable in the catalog (path-#1
+    // `index-plugin` registrations don't carry it); treat NULL
+    // as the empty JSON object so the hash stays stable.
+    let caps = if s.capabilities_json.is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        recanonicalize_json_str(s.capabilities_json)
+    };
+    let bytes = canonical_json_bytes(&[
+        Value::String("spatial_index".to_string()),
+        Value::String(s.method.to_string()),
+        caps,
+    ])
+    .expect("signature json is finite");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
+/// A preprocessor-pattern row's SQL-visible identity: the
+/// operator token that triggers the rewrite plus the SQL
+/// function it rewrites to.
+pub struct PreprocessorPatternSig<'a> {
+    pub op_token: &'a str,
+    pub function_name: &'a str,
+}
+pub fn preprocessor_pattern_signature_hash(p: &PreprocessorPatternSig<'_>) -> String {
+    let bytes = canonical_json_bytes(&[
+        Value::String("preprocessor_pattern".to_string()),
+        Value::String(p.op_token.to_string()),
+        Value::String(p.function_name.to_string()),
+    ])
+    .expect("signature json is finite");
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
 /// Deterministic blake3 over every `.rs` file under
 /// `helpers_root`. Alphabetical file traversal + relative-path
 /// bytes + `\0` boundary + file bytes. Cached per-process via a
@@ -260,5 +394,114 @@ mod tests {
         let tmp = std::env::temp_dir().join("shim_iface_helpers_missing_xyz");
         let h = helpers_hash(&tmp).unwrap();
         assert_eq!(h, *blake3::Hasher::new().finalize().as_bytes());
+    }
+
+    #[test]
+    fn column_type_hash_reflects_storage_size() {
+        let a = ColumnTypeSig {
+            type_name: "geometry",
+            storage_size: -1,
+            cast_from_json: "[]",
+            cast_to_json: "[]",
+        };
+        let b = ColumnTypeSig { storage_size: 128, ..a };
+        assert_ne!(column_type_signature_hash(&a), column_type_signature_hash(&b));
+    }
+
+    #[test]
+    fn column_type_hash_is_stable_across_whitespace() {
+        let a = ColumnTypeSig {
+            type_name: "geometry",
+            storage_size: -1,
+            cast_from_json: "[\"text\"]",
+            cast_to_json: "[]",
+        };
+        let b = ColumnTypeSig {
+            cast_from_json: "[ \"text\" ]",
+            ..a
+        };
+        assert_eq!(column_type_signature_hash(&a), column_type_signature_hash(&b));
+    }
+
+    #[test]
+    fn operator_hash_reflects_backing_function() {
+        let a = OperatorSig {
+            symbol: "&&",
+            lhs_type_id: Some(1),
+            rhs_type_id: Some(1),
+            backing_function: "geometry_overlaps",
+        };
+        let b = OperatorSig { backing_function: "st_intersects", ..a };
+        assert_ne!(operator_signature_hash(&a), operator_signature_hash(&b));
+    }
+
+    #[test]
+    fn operator_hash_handles_null_sides() {
+        let both_null = OperatorSig {
+            symbol: "!",
+            lhs_type_id: None,
+            rhs_type_id: None,
+            backing_function: "st_not",
+        };
+        let lhs_typed = OperatorSig { lhs_type_id: Some(0), ..both_null };
+        assert_ne!(
+            operator_signature_hash(&both_null),
+            operator_signature_hash(&lhs_typed)
+        );
+    }
+
+    #[test]
+    fn cast_rewrite_hash_reflects_rewrite_target() {
+        let a = CastRewriteSig {
+            source_type_id: 0,
+            target_type: "geometry",
+            source_kind: "any",
+            source_fn_hint: "",
+            rewrite_target: "st_geomfromwkb",
+        };
+        let b = CastRewriteSig { rewrite_target: "st_geomfromtext", ..a };
+        assert_ne!(cast_rewrite_signature_hash(&a), cast_rewrite_signature_hash(&b));
+    }
+
+    #[test]
+    fn spatial_index_hash_treats_empty_caps_as_empty_object() {
+        let a = SpatialIndexSig {
+            method: "gist_geometry_ops_2d",
+            capabilities_json: "",
+        };
+        let b = SpatialIndexSig {
+            method: "gist_geometry_ops_2d",
+            capabilities_json: "{}",
+        };
+        assert_eq!(spatial_index_signature_hash(&a), spatial_index_signature_hash(&b));
+    }
+
+    #[test]
+    fn spatial_index_hash_reflects_method() {
+        let a = SpatialIndexSig {
+            method: "gist_geometry_ops_2d",
+            capabilities_json: "{}",
+        };
+        let b = SpatialIndexSig {
+            method: "spgist_geometry_ops_2d",
+            capabilities_json: "{}",
+        };
+        assert_ne!(spatial_index_signature_hash(&a), spatial_index_signature_hash(&b));
+    }
+
+    #[test]
+    fn preprocessor_pattern_hash_reflects_function() {
+        let a = PreprocessorPatternSig {
+            op_token: "<->",
+            function_name: "st_distance",
+        };
+        let b = PreprocessorPatternSig {
+            op_token: "<->",
+            function_name: "st_maxdistance",
+        };
+        assert_ne!(
+            preprocessor_pattern_signature_hash(&a),
+            preprocessor_pattern_signature_hash(&b)
+        );
     }
 }

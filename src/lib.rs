@@ -62,7 +62,7 @@ pub type SharedConn = Rc<RefCell<Connection>>;
 
 /// Open a database, replace any existing file, apply the schema,
 /// and return a shareable handle. `SCHEMA_SQL` writes
-/// `PRAGMA user_version = 3` at its tail, so no explicit tagging
+/// `PRAGMA user_version = 4` at its tail, so no explicit tagging
 /// is needed here.
 pub fn open_fresh(path: &Path) -> Result<SharedConn> {
     if path != Path::new(":memory:") && path.exists() {
@@ -71,7 +71,7 @@ pub fn open_fresh(path: &Path) -> Result<SharedConn> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA_SQL)?;
-    // Defensive: schema.sql ends with `PRAGMA user_version = 3` but a
+    // Defensive: schema.sql ends with `PRAGMA user_version = 4` but a
     // future refactor might drop it accidentally. `ensure_schema`
     // treats an on-target DB as a no-op.
     ensure_schema(&conn)?;
@@ -188,11 +188,29 @@ fn extract_shim_inner(
         // because the spatial-index interface routes by alias,
         // not by stable id.
         for alias in &meta.aliases {
+            let sig = hashes::spatial_index_signature_hash(&hashes::SpatialIndexSig {
+                method: alias,
+                capabilities_json: &caps,
+            });
             let _ = c.execute(
                 "INSERT OR IGNORE INTO spatial_indexes \
-                 (extension, name, type_id, capabilities_json) \
-                 VALUES (?1, ?2, ?3, ?4)",
-                rusqlite::params![name, alias, 0i64, caps],
+                 (extension, name, type_id, capabilities_json, signature_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![name, alias, 0i64, caps, sig],
+            );
+            let _ = c.execute(
+                "UPDATE spatial_indexes \
+                    SET signature_hash = ?3, \
+                        capabilities_json = ?4, \
+                        status = CASE \
+                            WHEN signature_hash IS NOT NULL \
+                                 AND signature_hash != ?3 \
+                                 AND status = 'implemented_verified' \
+                                THEN 'implemented_unverified' \
+                            ELSE status END \
+                  WHERE extension = ?1 AND name = ?2 \
+                    AND (signature_hash IS NULL OR signature_hash != ?3)",
+                rusqlite::params![name, alias, sig, caps],
             );
         }
         let _ = (meta.name,);  // index "registry name" (e.g. "postgis-rtree")
@@ -248,6 +266,12 @@ pub fn extract_source_metadata(
     stamp_aggregate_rows(&c, extension_name, src, &impl_hash_by_iface, &helpers_only_impl_hash)?;
     stamp_simple_fn_rows(&c, "table_functions", extension_name, src, &impl_hash_by_iface, &helpers_only_impl_hash)?;
     stamp_simple_fn_rows(&c, "window_functions", extension_name, src, &impl_hash_by_iface, &helpers_only_impl_hash)?;
+    // v4 (B4): upstream-version stamping for the five non-function
+    // catalog tables. `signature_hash` was already populated at
+    // INSERT time (see `insert_casts` / `insert_operators` /
+    // register_data_type / register_index_builder / drain paths);
+    // this pass only fills first-seen (COALESCE) and last-seen.
+    stamp_v4_lineage_columns(&c, extension_name, src.upstream_version)?;
     drop(c);
 
     // 2. Walker-derived edges from the Rust source tree.
@@ -483,6 +507,41 @@ fn stamp_simple_fn_rows(
             sig,
             impl_hash,
         ])?;
+    }
+    Ok(())
+}
+
+/// v4 (B4): stamp `first_seen_upstream_version` (via COALESCE
+/// so first-seen sticks across ingests) and
+/// `last_seen_upstream_version` on every row in the five
+/// catalog tables extended by B4. Signature hashes were written
+/// at INSERT time by the row-writer helpers; this pass only
+/// touches the upstream-version columns.
+///
+/// Public so `postgis-shim-interface`'s CLI can rerun the pass
+/// after `drain_postgis_metadata` — that drain populates
+/// casts / operators / preprocessors AFTER `extract_source_metadata`
+/// has already run, and their upstream-version columns would
+/// otherwise stay NULL.
+pub fn stamp_v4_lineage_columns(
+    c: &Connection,
+    extension: &str,
+    upstream_version: &str,
+) -> Result<()> {
+    for table in [
+        "column_types",
+        "operators",
+        "cast_rewrites",
+        "spatial_indexes",
+        "preprocessor_patterns",
+    ] {
+        let sql = format!(
+            "UPDATE {table} \
+                SET first_seen_upstream_version = COALESCE(first_seen_upstream_version, ?2), \
+                    last_seen_upstream_version = ?2 \
+              WHERE extension = ?1"
+        );
+        c.execute(&sql, params![extension, upstream_version])?;
     }
     Ok(())
 }
@@ -955,18 +1014,47 @@ impl ExtensionTarget for SqliteExtensionTarget {
         &mut self,
         plugin: Arc<dyn DataTypePlugin>,
     ) -> Result<(), ExtensionError> {
-        let _ = self.conn.borrow().execute(
+        let type_id = plugin.type_id() as i64;
+        let type_name = plugin.type_name().to_string();
+        let storage_size = plugin.storage_size() as i64;
+        // cast_from/cast_to are placeholder empty arrays today; the
+        // shim doesn't surface them via the plugin trait. Hashing
+        // them still keeps the signature stable across ingests.
+        let cast_from = "[]";
+        let cast_to = "[]";
+        let sig = hashes::column_type_signature_hash(&hashes::ColumnTypeSig {
+            type_name: &type_name,
+            storage_size,
+            cast_from_json: cast_from,
+            cast_to_json: cast_to,
+        });
+        let c = self.conn.borrow();
+        let _ = c.execute(
             "INSERT OR IGNORE INTO column_types \
-             (extension, type_id, type_name, storage_size, cast_from_json, cast_to_json) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (extension, type_id, type_name, storage_size, cast_from_json, cast_to_json, \
+              signature_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                self.extension,
-                plugin.type_id() as i64,
-                plugin.type_name(),
-                plugin.storage_size() as i64,
-                "[]",
-                "[]",
+                self.extension, type_id, type_name, storage_size,
+                cast_from, cast_to, sig,
             ],
+        );
+        // If a legacy row (or a row inserted in the same session
+        // by a different pass) was missing signature_hash, or if
+        // the identity columns changed under us, demote its
+        // verification status.
+        let _ = c.execute(
+            "UPDATE column_types \
+                SET signature_hash = ?3, \
+                    status = CASE \
+                        WHEN signature_hash IS NOT NULL \
+                             AND signature_hash != ?3 \
+                             AND status = 'implemented_verified' \
+                            THEN 'implemented_unverified' \
+                        ELSE status END \
+              WHERE extension = ?1 AND type_id = ?2 \
+                AND (signature_hash IS NULL OR signature_hash != ?3)",
+            params![self.extension, type_id, sig],
         );
         Ok(())
     }
@@ -976,10 +1064,34 @@ impl ExtensionTarget for SqliteExtensionTarget {
         type_id: u32,
         _builder: Arc<dyn IndexBuilder>,
     ) -> Result<(), ExtensionError> {
-        let _ = self.conn.borrow().execute(
-            "INSERT OR IGNORE INTO spatial_indexes (extension, name, type_id) \
-             VALUES (?1, ?2, ?3)",
-            params![self.extension, format!("type_id={type_id}"), type_id as i64],
+        let name = format!("type_id={type_id}");
+        // The `index-plugin` registration path doesn't surface a
+        // capabilities blob (that's the `spatial-index-plugin`
+        // interface's job). Hash with an empty caps payload so
+        // the signature stays stable across the two paths.
+        let sig = hashes::spatial_index_signature_hash(&hashes::SpatialIndexSig {
+            method: &name,
+            capabilities_json: "",
+        });
+        let c = self.conn.borrow();
+        let _ = c.execute(
+            "INSERT OR IGNORE INTO spatial_indexes \
+             (extension, name, type_id, signature_hash) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![self.extension, name, type_id as i64, sig],
+        );
+        let _ = c.execute(
+            "UPDATE spatial_indexes \
+                SET signature_hash = ?3, \
+                    status = CASE \
+                        WHEN signature_hash IS NOT NULL \
+                             AND signature_hash != ?3 \
+                             AND status = 'implemented_verified' \
+                            THEN 'implemented_unverified' \
+                        ELSE status END \
+              WHERE extension = ?1 AND name = ?2 \
+                AND (signature_hash IS NULL OR signature_hash != ?3)",
+            params![self.extension, name, sig],
         );
         Ok(())
     }
@@ -1025,10 +1137,22 @@ fn insert_casts(conn: &Connection, extension: &str, casts: &[ExtractedCast]) -> 
         // would be treated as distinct by SQLite, which defeats the
         // dedup guarantee `INSERT OR IGNORE` gives us).
         let source_type_id = c.source_type_id.unwrap_or(0) as i64;
+        // B4: signature_hash is derived from the identity columns
+        // at INSERT time so the column is populated even for
+        // extractions that don't pass --src (upstream-version
+        // stamping still requires the source pass).
+        let sig = hashes::cast_rewrite_signature_hash(&hashes::CastRewriteSig {
+            source_type_id,
+            target_type: &c.target_type,
+            source_kind: &c.source_kind,
+            source_fn_hint: &c.source_fn_hint,
+            rewrite_target: &c.function_name,
+        });
         conn.execute(
             "INSERT OR IGNORE INTO cast_rewrites \
-             (extension, target_type, source_kind, function_name, source_fn_hint, source_type_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (extension, target_type, source_kind, function_name, source_fn_hint, \
+              source_type_id, signature_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 extension,
                 c.target_type,
@@ -1036,6 +1160,33 @@ fn insert_casts(conn: &Connection, extension: &str, casts: &[ExtractedCast]) -> 
                 c.function_name,
                 c.source_fn_hint,
                 source_type_id,
+                sig,
+            ],
+        )?;
+        // If the row already existed (INSERT OR IGNORE noop), the
+        // signature_hash column may still be NULL from a legacy
+        // ingest. Backfill it via a bounded UPDATE. If the stored
+        // hash differs from the freshly-computed one, demote status.
+        conn.execute(
+            "UPDATE cast_rewrites \
+                SET signature_hash = ?7, \
+                    status = CASE \
+                        WHEN signature_hash IS NOT NULL \
+                             AND signature_hash != ?7 \
+                             AND status = 'implemented_verified' \
+                            THEN 'implemented_unverified' \
+                        ELSE status END \
+              WHERE extension = ?1 AND target_type = ?2 AND source_kind = ?3 \
+                AND source_fn_hint = ?5 AND source_type_id = ?6 \
+                AND (signature_hash IS NULL OR signature_hash != ?7)",
+            params![
+                extension,
+                c.target_type,
+                c.source_kind,
+                c.function_name,
+                c.source_fn_hint,
+                source_type_id,
+                sig,
             ],
         )?;
     }
@@ -1048,16 +1199,40 @@ fn insert_operators(
     ops: &[ExtractedOperator],
 ) -> Result<()> {
     for o in ops {
+        let lhs = o.lhs_type_id.map(|n| n as i64);
+        let rhs = o.rhs_type_id.map(|n| n as i64);
+        let sig = hashes::operator_signature_hash(&hashes::OperatorSig {
+            symbol: &o.symbol,
+            lhs_type_id: lhs,
+            rhs_type_id: rhs,
+            backing_function: &o.function_name,
+        });
         conn.execute(
             "INSERT OR IGNORE INTO operators \
-             (extension, symbol, lhs_type_id, rhs_type_id, function_name) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                extension, o.symbol,
-                o.lhs_type_id.map(|n| n as i64),
-                o.rhs_type_id.map(|n| n as i64),
-                o.function_name,
-            ],
+             (extension, symbol, lhs_type_id, rhs_type_id, function_name, signature_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![extension, o.symbol, lhs, rhs, o.function_name, sig],
+        )?;
+        // Symbol / lhs / rhs are in the PK; backing_function is
+        // not. If backing_function changes across ingests, the
+        // signature_hash also changes; demote a previously
+        // verified row so verification is re-required.
+        //
+        // The `IS` comparison flavour handles the NULL-in-PK case
+        // uniformly (SQLite treats `NULL = NULL` as UNKNOWN).
+        conn.execute(
+            "UPDATE operators \
+                SET signature_hash = ?6, \
+                    status = CASE \
+                        WHEN signature_hash IS NOT NULL \
+                             AND signature_hash != ?6 \
+                             AND status = 'implemented_verified' \
+                            THEN 'implemented_unverified' \
+                        ELSE status END \
+              WHERE extension = ?1 AND symbol = ?2 \
+                AND lhs_type_id IS ?3 AND rhs_type_id IS ?4 \
+                AND (signature_hash IS NULL OR signature_hash != ?6)",
+            params![extension, o.symbol, lhs, rhs, o.function_name, sig],
         )?;
     }
     Ok(())
@@ -1069,11 +1244,28 @@ fn insert_preprocessors(
     pps: &[ExtractedPreprocessor],
 ) -> Result<()> {
     for p in pps {
+        let sig = hashes::preprocessor_pattern_signature_hash(&hashes::PreprocessorPatternSig {
+            op_token: &p.operator_token,
+            function_name: &p.function_name,
+        });
         conn.execute(
             "INSERT OR IGNORE INTO preprocessor_patterns \
-             (extension, op_token, function_name) \
-             VALUES (?1, ?2, ?3)",
-            params![extension, p.operator_token, p.function_name],
+             (extension, op_token, function_name, signature_hash) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![extension, p.operator_token, p.function_name, sig],
+        )?;
+        conn.execute(
+            "UPDATE preprocessor_patterns \
+                SET signature_hash = ?4, \
+                    status = CASE \
+                        WHEN signature_hash IS NOT NULL \
+                             AND signature_hash != ?4 \
+                             AND status = 'implemented_verified' \
+                            THEN 'implemented_unverified' \
+                        ELSE status END \
+              WHERE extension = ?1 AND op_token = ?2 \
+                AND (signature_hash IS NULL OR signature_hash != ?4)",
+            params![extension, p.operator_token, p.function_name, sig],
         )?;
     }
     Ok(())

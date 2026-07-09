@@ -1,4 +1,4 @@
--- Schema for the shim-interface SQLite database (v3).
+-- Schema for the shim-interface SQLite database (v4).
 --
 -- Every row's `extension` is the shim's WIT identity name
 -- (`"postgis"` / `"mobilitydb"` etc.); composite keys are
@@ -22,9 +22,22 @@
 --     surfaces: `status_summary_per_extension`, `leaf_coverage`,
 --     and `verification_freshness`. Views only — no data reshape.
 --
--- `PRAGMA user_version` is tagged to 3 at the tail so the migration
+-- v4 (B4) additions:
+--   - Lineage tracking mirrored onto five more catalog tables:
+--     `column_types`, `operators`, `cast_rewrites`,
+--     `spatial_indexes`, `preprocessor_patterns`. Each gains
+--     `first_seen_upstream_version`, `last_seen_upstream_version`,
+--     `deprecated_in_upstream_version`, `signature_hash`, `status`
+--     (with default `implemented_unverified`), plus three
+--     `last_verified_*` columns and a `notes` slot. No
+--     `implementation_hash` — these entities don't map to a source
+--     module; `signature_hash` is their identity.
+--   - `status_summary_per_extension` rolls up all nine kinds now.
+--   - Soft-enum triggers guarding `status` on the five new tables.
+--
+-- `PRAGMA user_version` is tagged to 4 at the tail so the migration
 -- code (see `shim-interface-core::migrations`) can distinguish a
--- fresh `open_fresh` DB from a legacy v1/v2 one that needs backfill.
+-- fresh `open_fresh` DB from a legacy v1/v2/v3 one that needs backfill.
 
 CREATE TABLE IF NOT EXISTS extensions (
     name TEXT PRIMARY KEY,
@@ -172,6 +185,18 @@ CREATE TABLE IF NOT EXISTS column_types (
     storage_size INTEGER NOT NULL,
     cast_from_json TEXT NOT NULL,
     cast_to_json TEXT NOT NULL,
+    -- v4 (B4) lineage tracking columns. Same shape as the four
+    -- function tables minus `implementation_hash` (types don't
+    -- map to a single source module; the signature IS the identity).
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     PRIMARY KEY (extension, type_id)
 );
 
@@ -181,6 +206,16 @@ CREATE TABLE IF NOT EXISTS operators (
     lhs_type_id INTEGER,
     rhs_type_id INTEGER,
     function_name TEXT NOT NULL,
+    -- v4 (B4) lineage tracking columns.
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     PRIMARY KEY (extension, symbol, lhs_type_id, rhs_type_id)
 );
 
@@ -195,6 +230,16 @@ CREATE TABLE IF NOT EXISTS cast_rewrites (
     -- `st_geomfromwkb` accepts any bit pattern). Populated from the
     -- WIT-side `cast-rewrite.source-type-id` field (#798).
     source_type_id INTEGER NOT NULL DEFAULT 0,
+    -- v4 (B4) lineage tracking columns.
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     -- `source_fn_hint` and `source_type_id` are part of the PK so
     -- distinct source-side rewrites that share a (target_type,
     -- source_kind) key don't collide under `INSERT OR IGNORE`.
@@ -215,6 +260,16 @@ CREATE TABLE IF NOT EXISTS preprocessor_patterns (
     extension TEXT NOT NULL,
     op_token TEXT NOT NULL,
     function_name TEXT NOT NULL,
+    -- v4 (B4) lineage tracking columns.
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     PRIMARY KEY (extension, op_token)
 );
 
@@ -248,6 +303,16 @@ CREATE TABLE IF NOT EXISTS spatial_indexes (
     name TEXT NOT NULL,
     type_id INTEGER NOT NULL,
     capabilities_json TEXT,
+    -- v4 (B4) lineage tracking columns.
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     PRIMARY KEY (extension, name)
 );
 
@@ -359,6 +424,43 @@ CREATE TRIGGER IF NOT EXISTS trg_window_functions_status_enum
          'deprecated','unimplemented','skip')
     BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
 
+-- v4 (B4): status enum guards for the five newly-tracked
+-- catalog tables. Same discriminant as the function-side triggers.
+CREATE TRIGGER IF NOT EXISTS trg_column_types_status_enum
+    BEFORE INSERT ON column_types
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_operators_status_enum
+    BEFORE INSERT ON operators
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cast_rewrites_status_enum
+    BEFORE INSERT ON cast_rewrites
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_spatial_indexes_status_enum
+    BEFORE INSERT ON spatial_indexes
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_preprocessor_patterns_status_enum
+    BEFORE INSERT ON preprocessor_patterns
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
+
 CREATE VIEW IF NOT EXISTS extension_counts AS
 SELECT
     e.name AS extension,
@@ -413,11 +515,12 @@ SELECT root_extension, root_callee, extension, caller_name, MIN(depth) AS depth
     FROM rev
     GROUP BY root_extension, root_callee, extension, caller_name;
 
--- v3 (B3): status roll-up rolled per (extension, status) across
--- every function-kind table. Consumed by funcs-md-gen and by the
--- coverage dashboards. Distinct from `function_status_summary` in
--- that the kind axis is folded away — B3 tracking cares about
--- "total function names in this extension" rather than kind splits.
+-- v3 (B3), extended v4 (B4): status roll-up rolled per
+-- (extension, status) across every tracked catalog table.
+-- Consumed by funcs-md-gen and the coverage dashboards. B4
+-- widens the union from four function tables to nine so the
+-- Types/Operators/Casts/Spatial Indexes/Preprocessor Patterns
+-- lineage columns are visible in the same view.
 CREATE VIEW IF NOT EXISTS status_summary_per_extension AS
     SELECT extension, status, COUNT(*) AS n
     FROM (
@@ -425,18 +528,60 @@ CREATE VIEW IF NOT EXISTS status_summary_per_extension AS
         UNION ALL SELECT extension, status FROM aggregates
         UNION ALL SELECT extension, status FROM table_functions
         UNION ALL SELECT extension, status FROM window_functions
+        UNION ALL SELECT extension, status FROM column_types
+        UNION ALL SELECT extension, status FROM operators
+        UNION ALL SELECT extension, status FROM cast_rewrites
+        UNION ALL SELECT extension, status FROM spatial_indexes
+        UNION ALL SELECT extension, status FROM preprocessor_patterns
     )
     GROUP BY extension, status;
 
--- v3 (B3): per-leaf coverage. `leaf` comes from the first entry
--- of `test_cases.tags_json` when it carries the `leaf:*` prefix
--- (scraper convention: leaf tag is the second element, after the
--- corpus tag). We surface leaves via json_extract on `$[1]` when
--- present, falling back to `$[0]`. The join to `scalars` intentionally
--- LEFT-outer joins so cases whose canonical row lives in aggregates
--- / table_functions / window_functions still count as "functions
--- with cases" — verified counts stay scalar-only because the
--- 2026-07 verification harness only promotes scalars.
+-- v4 (B4): status roll-up split by (extension, kind, status) —
+-- keeps the kind axis so funcs-md-gen can render one line per
+-- entity kind ("Types (29): 0 verified / 29 unverified", ...).
+CREATE VIEW IF NOT EXISTS status_summary_per_kind AS
+    SELECT extension, 'scalar' AS kind, status, COUNT(*) AS n
+        FROM scalars               GROUP BY extension, status
+    UNION ALL
+    SELECT extension, 'aggregate',          status, COUNT(*)
+        FROM aggregates            GROUP BY extension, status
+    UNION ALL
+    SELECT extension, 'table_function',     status, COUNT(*)
+        FROM table_functions       GROUP BY extension, status
+    UNION ALL
+    SELECT extension, 'window_function',    status, COUNT(*)
+        FROM window_functions      GROUP BY extension, status
+    UNION ALL
+    SELECT extension, 'column_type',        status, COUNT(*)
+        FROM column_types          GROUP BY extension, status
+    UNION ALL
+    SELECT extension, 'operator',           status, COUNT(*)
+        FROM operators             GROUP BY extension, status
+    UNION ALL
+    SELECT extension, 'cast_rewrite',       status, COUNT(*)
+        FROM cast_rewrites         GROUP BY extension, status
+    UNION ALL
+    SELECT extension, 'spatial_index',      status, COUNT(*)
+        FROM spatial_indexes       GROUP BY extension, status
+    UNION ALL
+    SELECT extension, 'preprocessor_pattern', status, COUNT(*)
+        FROM preprocessor_patterns GROUP BY extension, status;
+
+-- v3 (B3), extended v4 (B4): per-leaf coverage. `leaf` comes from
+-- the first entry of `test_cases.tags_json` that carries the
+-- `leaf:*` prefix (scraper convention: leaf tag is the second
+-- element, after the corpus tag). We surface leaves via json_each
+-- lookup, falling back to `$[0]`.
+--
+-- v4 broadens the "verified?" check from scalars-only to a
+-- COALESCE over every table where `test_cases.function_name`
+-- can match a row identity (scalars.name / aggregates.name /
+-- table_functions.name / window_functions.name). Types /
+-- operators / casts / spatial indexes / preprocessor patterns
+-- don't get verified via `test_cases.function_name` today, so
+-- they aren't joined here — they surface in
+-- `status_summary_per_kind` instead. Adding them as extra LEFT
+-- JOINs would risk row-multiplication on the aggregate side.
 CREATE VIEW IF NOT EXISTS leaf_coverage AS
     SELECT
         tc.extension,
@@ -446,17 +591,28 @@ CREATE VIEW IF NOT EXISTS leaf_coverage AS
             json_extract(tc.tags_json, '$[0]')
         ) AS leaf,
         COUNT(DISTINCT tc.function_name) AS functions_with_cases,
-        SUM(CASE WHEN s.status = 'implemented_verified' THEN 1 ELSE 0 END)
-            AS verified_functions,
+        SUM(CASE
+            WHEN COALESCE(s.status, a.status, tf.status, wf.status)
+                = 'implemented_verified' THEN 1 ELSE 0
+        END) AS verified_functions,
         ROUND(
             100.0 *
-            SUM(CASE WHEN s.status = 'implemented_verified' THEN 1 ELSE 0 END)
+            SUM(CASE
+                WHEN COALESCE(s.status, a.status, tf.status, wf.status)
+                    = 'implemented_verified' THEN 1 ELSE 0
+            END)
             / COUNT(DISTINCT tc.function_name),
             1
         ) AS coverage_pct
     FROM test_cases tc
     LEFT JOIN scalars s
       ON s.extension = tc.extension AND s.name = tc.function_name
+    LEFT JOIN aggregates a
+      ON a.extension = tc.extension AND a.name = tc.function_name
+    LEFT JOIN table_functions tf
+      ON tf.extension = tc.extension AND tf.name = tc.function_name
+    LEFT JOIN window_functions wf
+      ON wf.extension = tc.extension AND wf.name = tc.function_name
     GROUP BY tc.extension, leaf;
 
 -- v3 (B3): last-verified freshness — one row per scalar with a
@@ -468,4 +624,4 @@ CREATE VIEW IF NOT EXISTS verification_freshness AS
     FROM scalars
     WHERE status = 'implemented_verified';
 
-PRAGMA user_version = 3;
+PRAGMA user_version = 4;

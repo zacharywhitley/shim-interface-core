@@ -16,7 +16,7 @@ use rusqlite::Connection;
 /// The schema version this build of `shim-interface-core` writes
 /// and understands. Bump in lockstep with `schema.sql`'s
 /// `PRAGMA user_version = N`.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Read the DB's `PRAGMA user_version`. A fresh SQLite file
 /// reports 0 -- that's treated as the pre-v1 legacy shape (which
@@ -29,7 +29,7 @@ pub fn read_user_version(conn: &Connection) -> Result<u32> {
 
 /// Write `PRAGMA user_version`. Callers only need this from the
 /// migration path -- `open_fresh` gets the tag via the trailing
-/// `PRAGMA user_version = 2` in `schema.sql`.
+/// `PRAGMA user_version = 4` in `schema.sql`.
 pub fn write_user_version(conn: &Connection, v: u32) -> Result<()> {
     conn.execute_batch(&format!("PRAGMA user_version = {v}"))?;
     Ok(())
