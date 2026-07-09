@@ -582,6 +582,33 @@ fn insert_derived_edges(c: &Connection, extension: &str) -> Result<()> {
     // (a) type_arg + type_return -- walk param_types_json (JSON
     // array of arrays of type-name strings) and cross-reference
     // column_types. See B0 §4.4.
+    //
+    // Task #43 note (2026-07-09): today's PostGIS/MobilityDB
+    // extractions produce zero type_arg / type_return rows even
+    // though the SQL below is unchanged and runs every extraction.
+    // The gap is a naming-scope mismatch between the two sides of
+    // the join, not a missing pass:
+    //
+    //   * `param_types_json` / `return_type` come from
+    //     `ExtensionTarget::register_scalar_function` (and friends)
+    //     which stores the *post-wire* type by debug-printing the
+    //     `ParamType` enum, so values are `binary`, `int64`,
+    //     `text`, `float64`, `boolean`.
+    //   * `column_types.type_name` is the fully-qualified WIT
+    //     record identifier the shim registered, e.g.
+    //     `postgis:wasm@0.1.0/postgis-types/coord`.
+    //
+    // These namespaces do not overlap, so `ct.type_name = j.value`
+    // matches nothing on postgis / mobilitydb.  The pass is kept in
+    // place so it will start producing edges automatically once a
+    // future extractor extension surfaces WIT-side type names on
+    // the function-registration path, or once `column_types` is
+    // widened to carry both a qualified id and a short alias.
+    //
+    // Downstream tooling that needs "which functions consume/produce
+    // type X" today should union in the walker's `call_method`
+    // edges (which name accessors on the WIT-generated type) and
+    // the `cast_target` / `operator_bind` edges below.
     for (kind_col, kind_val) in [
         ("scalars", "scalar"),
         ("aggregates", "aggregate"),
@@ -604,7 +631,8 @@ fn insert_derived_edges(c: &Connection, extension: &str) -> Result<()> {
     }
 
     // return_type edge (scalars only -- other kinds don't have a
-    // scalar return_type column).
+    // scalar return_type column).  Same naming-scope gap as
+    // type_arg above; see task #43 note.
     c.execute(
         "INSERT OR IGNORE INTO function_dependencies \
          (extension, caller_name, caller_kind, callee_extension, callee_name, callee_kind, edge_kind, source_hint) \
@@ -615,7 +643,10 @@ fn insert_derived_edges(c: &Connection, extension: &str) -> Result<()> {
         params![extension],
     )?;
 
-    // (b) cast_target edges.
+    // (b) cast_target edges.  `cast_rewrites.target_type` stores
+    // short SQL-side type names (`geometry`, `box3d`, `svg`, ...)
+    // that likewise do not string-equal `column_types.type_name`
+    // fully-qualified WIT ids -- see task #43 note above.
     c.execute(
         "INSERT OR IGNORE INTO function_dependencies \
          (extension, caller_name, caller_kind, callee_extension, callee_name, callee_kind, edge_kind, source_hint) \
