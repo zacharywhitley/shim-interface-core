@@ -11,16 +11,19 @@
 # Schema
 # ------
 # The TOML shape mirrors the per-extension `leaves.toml`
-# umbrella entries with two extensions:
+# umbrella entries with one extension:
 #
 #   1. `expands_to` entries may be `<extension>:<leaf-or-umbrella>`
 #      qualified references (e.g. `postgis:spatio`,
 #      `mobilitydb:mobilitydb_spatiotemporal_core`). Bare
 #      identifiers (no colon) refer to an umbrella defined in
 #      this file itself.
-#   2. A top-level `extension = "cross"` marker distinguishes
-#      cross-extension umbrellas from per-extension ones when a
-#      multi-catalog consumer merges everything into one namespace.
+#
+# The top-level `extension = "cross"` marker distinguishes cross-
+# extension umbrellas from per-extension ones when a multi-catalog
+# consumer merges everything into one namespace. Per-umbrella
+# `extension` / `kind` fields are not part of the deserialization
+# schema and must not appear on individual `[[umbrella]]` entries.
 #
 # Consumption
 # -----------
@@ -103,31 +106,26 @@ expands_to  = [
 
 [[umbrella]]
 id          = "temporal"
-extension   = "cross"
-kind        = "capability"
+description = "Non-spatial temporal surface — MobilityDB temporal types + TimescaleDB time-series primitives + hypertable mgmt + counter/gauge stats."
 expands_to  = [
     "mobilitydb:mobilitydb_temporal_core",
     "timescaledb:timescale_core",
     "timescaledb:timescale_hypertable_mgmt",
     "timescaledb:timescale_toolkit_stats",
 ]
-description = "Non-spatial temporal surface — MobilityDB temporal types + TimescaleDB time-series primitives + hypertable mgmt + counter/gauge stats."
 
 [[umbrella]]
 id          = "time-series-spatial"
-extension   = "cross"
-kind        = "capability"
+description = "Static geometry over time-series — PostGIS 2D vector + TimescaleDB hypertables. No moving objects."
 expands_to  = [
     "postgis:spatio",
     "timescaledb:timescale_core",
     "timescaledb:timescale_hypertable_mgmt",
 ]
-description = "Static geometry over time-series — PostGIS 2D vector + TimescaleDB hypertables. No moving objects."
 
 [[umbrella]]
 id          = "time-series-spatiotemporal"
-extension   = "cross"
-kind        = "capability"
+description = "Three-way union: PostGIS geometry + MobilityDB moving objects + TimescaleDB hypertables. Superset of `spatiotemporal`."
 expands_to  = [
     "postgis:spatio",
     "mobilitydb:mobilitydb_temporal_core",
@@ -136,14 +134,12 @@ expands_to  = [
     "timescaledb:timescale_core",
     "timescaledb:timescale_hypertable_mgmt",
 ]
-description = "Three-way union: PostGIS geometry + MobilityDB moving objects + TimescaleDB hypertables. Superset of `spatiotemporal`."
 
 # ----- Task axis (TimescaleDB additions) -----
 
 [[umbrella]]
 id          = "mobility-tracking"
-extension   = "cross"
-kind        = "task"
+description = "Live fleet/trajectory tracking — spatiotemporal + hypertables + continuous aggregates + retention."
 expands_to  = [
     "postgis:spatio",
     "mobilitydb:mobilitydb_temporal_core",
@@ -154,13 +150,10 @@ expands_to  = [
     "timescaledb:timescale_continuous_agg",
     "timescaledb:timescale_policy",
 ]
-description = "Live fleet/trajectory tracking — spatiotemporal + hypertables + continuous aggregates + retention."
 
 # ----- Backwards-compat aliases (TimescaleDB) -----
 
 [[umbrella]]
 id          = "timescaledb"
-extension   = "cross"
-kind        = "compat"
-expands_to  = [ "timescaledb:timescaledb" ]
 description = "Cross-ext alias — TimescaleDB has no cross-ext deps, so this delegates directly to the per-ext `timescaledb` compat umbrella."
+expands_to  = [ "timescaledb:timescaledb" ]
