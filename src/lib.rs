@@ -62,7 +62,7 @@ pub type SharedConn = Rc<RefCell<Connection>>;
 
 /// Open a database, replace any existing file, apply the schema,
 /// and return a shareable handle. `SCHEMA_SQL` writes
-/// `PRAGMA user_version = 2` at its tail, so no explicit tagging
+/// `PRAGMA user_version = 3` at its tail, so no explicit tagging
 /// is needed here.
 pub fn open_fresh(path: &Path) -> Result<SharedConn> {
     if path != Path::new(":memory:") && path.exists() {
@@ -71,9 +71,9 @@ pub fn open_fresh(path: &Path) -> Result<SharedConn> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA_SQL)?;
-    // Defensive: schema.sql ends with `PRAGMA user_version = 2` but a
+    // Defensive: schema.sql ends with `PRAGMA user_version = 3` but a
     // future refactor might drop it accidentally. `ensure_schema`
-    // treats a v2 DB as a no-op.
+    // treats an on-target DB as a no-op.
     ensure_schema(&conn)?;
     Ok(Rc::new(RefCell::new(conn)))
 }
@@ -86,7 +86,7 @@ pub fn open_fresh(path: &Path) -> Result<SharedConn> {
 pub fn open_or_migrate(path: &Path) -> Result<SharedConn> {
     let conn = Connection::open(path)?;
     // If the DB is empty (first-time open on a non-existent file),
-    // execute the schema to bring it directly to v2.
+    // execute the schema to bring it directly to the current version.
     let has_tables: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'extensions'",
         [],

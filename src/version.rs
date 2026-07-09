@@ -16,7 +16,7 @@ use rusqlite::Connection;
 /// The schema version this build of `shim-interface-core` writes
 /// and understands. Bump in lockstep with `schema.sql`'s
 /// `PRAGMA user_version = N`.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Read the DB's `PRAGMA user_version`. A fresh SQLite file
 /// reports 0 -- that's treated as the pre-v1 legacy shape (which

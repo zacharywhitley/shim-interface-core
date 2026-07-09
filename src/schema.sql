@@ -1,4 +1,4 @@
--- Schema for the shim-interface SQLite database (v2).
+-- Schema for the shim-interface SQLite database (v3).
 --
 -- Every row's `extension` is the shim's WIT identity name
 -- (`"postgis"` / `"mobilitydb"` etc.); composite keys are
@@ -16,9 +16,15 @@
 --     `test_cases`, `test_runs` with supporting indexes.
 --   - Soft-enum triggers guarding `status` values against
 --     hand-editing.
--- `PRAGMA user_version` is tagged to 2 at the tail so the migration
+--
+-- v3 (B3) additions:
+--   - Three coverage views feeding the auto-generated FUNCTIONS.md
+--     surfaces: `status_summary_per_extension`, `leaf_coverage`,
+--     and `verification_freshness`. Views only — no data reshape.
+--
+-- `PRAGMA user_version` is tagged to 3 at the tail so the migration
 -- code (see `shim-interface-core::migrations`) can distinguish a
--- fresh `open_fresh` DB from a legacy v1 one that needs backfill.
+-- fresh `open_fresh` DB from a legacy v1/v2 one that needs backfill.
 
 CREATE TABLE IF NOT EXISTS extensions (
     name TEXT PRIMARY KEY,
@@ -407,4 +413,59 @@ SELECT root_extension, root_callee, extension, caller_name, MIN(depth) AS depth
     FROM rev
     GROUP BY root_extension, root_callee, extension, caller_name;
 
-PRAGMA user_version = 2;
+-- v3 (B3): status roll-up rolled per (extension, status) across
+-- every function-kind table. Consumed by funcs-md-gen and by the
+-- coverage dashboards. Distinct from `function_status_summary` in
+-- that the kind axis is folded away — B3 tracking cares about
+-- "total function names in this extension" rather than kind splits.
+CREATE VIEW IF NOT EXISTS status_summary_per_extension AS
+    SELECT extension, status, COUNT(*) AS n
+    FROM (
+        SELECT extension, status FROM scalars
+        UNION ALL SELECT extension, status FROM aggregates
+        UNION ALL SELECT extension, status FROM table_functions
+        UNION ALL SELECT extension, status FROM window_functions
+    )
+    GROUP BY extension, status;
+
+-- v3 (B3): per-leaf coverage. `leaf` comes from the first entry
+-- of `test_cases.tags_json` when it carries the `leaf:*` prefix
+-- (scraper convention: leaf tag is the second element, after the
+-- corpus tag). We surface leaves via json_extract on `$[1]` when
+-- present, falling back to `$[0]`. The join to `scalars` intentionally
+-- LEFT-outer joins so cases whose canonical row lives in aggregates
+-- / table_functions / window_functions still count as "functions
+-- with cases" — verified counts stay scalar-only because the
+-- 2026-07 verification harness only promotes scalars.
+CREATE VIEW IF NOT EXISTS leaf_coverage AS
+    SELECT
+        tc.extension,
+        COALESCE(
+            (SELECT j.value FROM json_each(tc.tags_json) AS j
+                WHERE j.value LIKE 'leaf:%' LIMIT 1),
+            json_extract(tc.tags_json, '$[0]')
+        ) AS leaf,
+        COUNT(DISTINCT tc.function_name) AS functions_with_cases,
+        SUM(CASE WHEN s.status = 'implemented_verified' THEN 1 ELSE 0 END)
+            AS verified_functions,
+        ROUND(
+            100.0 *
+            SUM(CASE WHEN s.status = 'implemented_verified' THEN 1 ELSE 0 END)
+            / COUNT(DISTINCT tc.function_name),
+            1
+        ) AS coverage_pct
+    FROM test_cases tc
+    LEFT JOIN scalars s
+      ON s.extension = tc.extension AND s.name = tc.function_name
+    GROUP BY tc.extension, leaf;
+
+-- v3 (B3): last-verified freshness — one row per scalar with a
+-- non-null `implemented_verified` status, so CI can spot rows whose
+-- last verification predates the shim's current upstream version.
+CREATE VIEW IF NOT EXISTS verification_freshness AS
+    SELECT extension, name, status, last_verified_at,
+           last_verified_upstream_version
+    FROM scalars
+    WHERE status = 'implemented_verified';
+
+PRAGMA user_version = 3;

@@ -26,6 +26,10 @@ pub fn apply(conn: &Connection, from: u32, to: u32) -> Result<()> {
                 apply_v1_to_v2(conn).context("applying v1 -> v2 migration")?;
                 v = 2;
             }
+            2 => {
+                apply_v2_to_v3(conn).context("applying v2 -> v3 migration")?;
+                v = 3;
+            }
             other => bail!(
                 "no migration path from schema v{other}; \
                  update shim-interface-core"
@@ -36,9 +40,16 @@ pub fn apply(conn: &Connection, from: u32, to: u32) -> Result<()> {
 }
 
 const V1_TO_V2_SQL: &str = include_str!("migrations/v1_to_v2.sql");
+const V2_TO_V3_SQL: &str = include_str!("migrations/v2_to_v3.sql");
 
 fn apply_v1_to_v2(conn: &Connection) -> Result<()> {
     conn.execute_batch(V1_TO_V2_SQL)
         .context("executing v1_to_v2.sql")?;
+    Ok(())
+}
+
+fn apply_v2_to_v3(conn: &Connection) -> Result<()> {
+    conn.execute_batch(V2_TO_V3_SQL)
+        .context("executing v2_to_v3.sql")?;
     Ok(())
 }
