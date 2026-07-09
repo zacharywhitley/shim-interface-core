@@ -16,3 +16,8 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 blake3 = "1"
+walkdir = "2"
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+
+[dev-dependencies]
+tempfile = "3"

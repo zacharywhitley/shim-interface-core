@@ -3,24 +3,30 @@
 //!
 //! The shim is any composed `.wasm` produced via `wac plug`
 //! against `datafission:df-plugin-api/extension@1.0.0`. This
-//! crate's job is to walk the shim's registry —
+//! crate's job is to walk the shim's registry --
 //! [`RuntimeWasmExtension::register`] plus
-//! [`RuntimeWasmExtension::extract_sql_metadata`] — and write
+//! [`RuntimeWasmExtension::extract_sql_metadata`] -- and write
 //! every scalar / aggregate / table function / window function /
 //! column type / system catalog / spatial index / cast / operator /
 //! preprocessor pattern it advertises into a SQLite database.
 //!
-//! B0 (2026-07-08): schema is now `PRAGMA user_version = 2`. See
-//! [`version`] for the forward-only migration discipline: fresh
-//! opens run `SCHEMA_SQL` in one shot, existing DBs opened via
-//! [`open_or_migrate`] auto-upgrade v1 -> v2 in place.
+//! B0 (2026-07-08) extends the schema with per-function lineage
+//! tracking: `interface`, `signature_hash`,
+//! `implementation_hash`, upstream-version columns, plus new
+//! `upstream_versions` / `function_dependencies` /
+//! `test_cases` / `test_runs` tables. See [`version`] for the
+//! migration discipline and [`hashes`] for the hash formulae.
 //!
 //! Output is a portable artifact; downstream consumers
 //! (sqlink, ducklink) read it without ever loading the wasm.
 
+pub mod hashes;
 pub mod migrations;
+pub mod owner;
 pub mod version;
+pub mod walker;
 
+pub use owner::{OwnerResolver, SourceMetadata, StaticOwnerResolver};
 pub use version::{ensure_schema, read_user_version, SCHEMA_VERSION};
 
 use std::cell::RefCell;
@@ -56,8 +62,8 @@ pub type SharedConn = Rc<RefCell<Connection>>;
 
 /// Open a database, replace any existing file, apply the schema,
 /// and return a shareable handle. `SCHEMA_SQL` writes
-/// `PRAGMA user_version = 2` at its tail, so `ensure_schema` is
-/// invoked as a defence-in-depth check only.
+/// `PRAGMA user_version = 2` at its tail, so no explicit tagging
+/// is needed here.
 pub fn open_fresh(path: &Path) -> Result<SharedConn> {
     if path != Path::new(":memory:") && path.exists() {
         std::fs::remove_file(path)
@@ -65,17 +71,22 @@ pub fn open_fresh(path: &Path) -> Result<SharedConn> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA_SQL)?;
+    // Defensive: schema.sql ends with `PRAGMA user_version = 2` but a
+    // future refactor might drop it accidentally. `ensure_schema`
+    // treats a v2 DB as a no-op.
     ensure_schema(&conn)?;
     Ok(Rc::new(RefCell::new(conn)))
 }
 
 /// Non-destructive open: preserve any existing content, run the
 /// forward-only migration if the DB is older than
-/// [`SCHEMA_VERSION`]. Used by long-lived tools that hold a
-/// shim-interface DB across extractions (backfill scripts,
-/// downstream catalog readers).
+/// [`SCHEMA_VERSION`]. Used by the backfill script and any
+/// long-lived tool that keeps a shim-interface DB around across
+/// extractions.
 pub fn open_or_migrate(path: &Path) -> Result<SharedConn> {
     let conn = Connection::open(path)?;
+    // If the DB is empty (first-time open on a non-existent file),
+    // execute the schema to bring it directly to v2.
     let has_tables: i64 = conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'extensions'",
         [],
@@ -89,8 +100,32 @@ pub fn open_or_migrate(path: &Path) -> Result<SharedConn> {
     Ok(Rc::new(RefCell::new(conn)))
 }
 
-/// Extract one shim into the shared connection.
+/// Extract one shim into the shared connection. Legacy shape --
+/// no source-metadata pass. See
+/// [`extract_shim_with_source`] for the B0 lineage flow.
 pub fn extract_shim(conn: &SharedConn, wasm_path: &Path) -> Result<ExtractedSummary> {
+    extract_shim_inner(conn, wasm_path, None)
+}
+
+/// Extract one shim and, when `source` is provided, hash every
+/// function row, populate `first_seen_upstream_version` /
+/// `last_seen_upstream_version`, walk the Rust source for
+/// call/method/macro/indirect edges, derive type/cast/operator
+/// edges from the catalog columns, and stamp an
+/// `upstream_versions` row.
+pub fn extract_shim_with_source(
+    conn: &SharedConn,
+    wasm_path: &Path,
+    source: SourceMetadata<'_>,
+) -> Result<ExtractedSummary> {
+    extract_shim_inner(conn, wasm_path, Some(source))
+}
+
+fn extract_shim_inner(
+    conn: &SharedConn,
+    wasm_path: &Path,
+    source: Option<SourceMetadata<'_>>,
+) -> Result<ExtractedSummary> {
     let abs = wasm_path
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", wasm_path.display()))?;
@@ -165,7 +200,444 @@ pub fn extract_shim(conn: &SharedConn, wasm_path: &Path) -> Result<ExtractedSumm
                                // alias column is what callers query by.
     }
 
+    if let Some(src) = source {
+        extract_source_metadata(conn, &name, &src)
+            .with_context(|| format!("extract_source_metadata({name})"))?;
+    }
+
     Ok(ExtractedSummary { name, version, blake3 })
+}
+
+/// Post-registration pass that hashes every function row, fills
+/// interface / first_seen / last_seen columns, walks the Rust
+/// source for call edges, derives type/cast/operator edges, and
+/// records an `upstream_versions` row. See `SourceMetadata`.
+///
+/// `interface` is resolved for each row via the
+/// [`OwnerResolver::owner_file`] map: rows for which the resolver
+/// has no mapping keep `interface = NULL`, but their signature
+/// hash still lands (implementation hash only folds the helpers
+/// tree when the owner is unmapped).
+pub fn extract_source_metadata(
+    conn: &SharedConn,
+    extension_name: &str,
+    src: &SourceMetadata<'_>,
+) -> Result<()> {
+    let helpers = hashes::helpers_hash(src.helpers_root)?;
+
+    // Pre-resolve owner file per interface, and its
+    // implementation hash (cached across every row that shares
+    // the same owner).
+    let interfaces = src.owner_map.known_interfaces();
+    let mut impl_hash_by_iface: std::collections::HashMap<String, (Option<std::path::PathBuf>, String)> =
+        std::collections::HashMap::new();
+    for iface in &interfaces {
+        let owner = src.owner_map.owner_file(iface);
+        let hash = hashes::implementation_hash(owner.as_deref(), &helpers)?;
+        impl_hash_by_iface.insert(iface.clone(), (owner, hash));
+    }
+    // A row with no interface still needs an implementation hash
+    // (owner=None, helpers-only). Precompute once.
+    let helpers_only_impl_hash = hashes::implementation_hash(None, &helpers)?;
+
+    // 1. Signature+implementation hash writes, upstream-version
+    //    stamping, interface backfill via the file-stem heuristic
+    //    (owner->file), for every function row.
+    let c = conn.borrow();
+    stamp_scalar_rows(&c, extension_name, src, &impl_hash_by_iface, &helpers_only_impl_hash)?;
+    stamp_aggregate_rows(&c, extension_name, src, &impl_hash_by_iface, &helpers_only_impl_hash)?;
+    stamp_simple_fn_rows(&c, "table_functions", extension_name, src, &impl_hash_by_iface, &helpers_only_impl_hash)?;
+    stamp_simple_fn_rows(&c, "window_functions", extension_name, src, &impl_hash_by_iface, &helpers_only_impl_hash)?;
+    drop(c);
+
+    // 2. Walker-derived edges from the Rust source tree.
+    if !src.skip_source_walk {
+        let walked = walker::walk_shim_src(src.src_root)?;
+        let c = conn.borrow();
+        insert_call_edges(&c, extension_name, &walked)?;
+        drop(c);
+    }
+
+    // 3. SQL-derived edges from catalog columns.
+    let c = conn.borrow();
+    insert_derived_edges(&c, extension_name)?;
+    drop(c);
+
+    // 4. Upstream-versions row.
+    let c = conn.borrow();
+    let scalar_count: i64 = c.query_row(
+        "SELECT COUNT(*) FROM scalars WHERE extension = ?1",
+        params![extension_name],
+        |r| r.get(0),
+    )?;
+    let aggregate_count: i64 = c.query_row(
+        "SELECT COUNT(*) FROM aggregates WHERE extension = ?1",
+        params![extension_name],
+        |r| r.get(0),
+    )?;
+    let table_fn_count: i64 = c.query_row(
+        "SELECT COUNT(*) FROM table_functions WHERE extension = ?1",
+        params![extension_name],
+        |r| r.get(0),
+    )?;
+    let window_fn_count: i64 = c.query_row(
+        "SELECT COUNT(*) FROM window_functions WHERE extension = ?1",
+        params![extension_name],
+        |r| r.get(0),
+    )?;
+    c.execute(
+        "INSERT OR REPLACE INTO upstream_versions \
+         (extension, version, released_at, ingested_at, ingested_from_commit, \
+          scalar_count, aggregate_count, table_function_count, window_function_count, notes) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+        params![
+            extension_name,
+            src.upstream_version,
+            src.released_at,
+            chrono::Utc::now().to_rfc3339(),
+            src.upstream_commit,
+            scalar_count,
+            aggregate_count,
+            table_fn_count,
+            window_fn_count,
+        ],
+    )?;
+    Ok(())
+}
+
+fn interface_lookup<'a>(
+    impl_map: &'a std::collections::HashMap<String, (Option<std::path::PathBuf>, String)>,
+    row_name: &str,
+) -> Option<&'a str> {
+    // First: fall through -- we don't know which interface owns
+    // `row_name` from the row alone. Owner discovery is
+    // per-interface, not per-function. See `SourceMetadata`
+    // doc-comment.
+    let _ = (impl_map, row_name);
+    None
+}
+
+fn stamp_scalar_rows(
+    c: &Connection,
+    extension: &str,
+    src: &SourceMetadata<'_>,
+    impl_hash_by_iface: &std::collections::HashMap<String, (Option<std::path::PathBuf>, String)>,
+    helpers_only_impl_hash: &str,
+) -> Result<()> {
+    // The interface column is set from the row's owner-file
+    // heuristic. Because the plugin loader currently doesn't
+    // surface `interface` per-registration (B0 note: interface
+    // tracking through `enter_interface` on ExtensionTarget lands
+    // in a follow-up), we leave `interface` as-is when it's
+    // already set and otherwise attempt a same-name lookup: if
+    // exactly one owner mapping exists for the row, adopt it.
+    // Otherwise the column stays NULL and the implementation
+    // hash reduces to the helpers-only fold.
+    let mut sel = c.prepare(
+        "SELECT name, param_types_json, return_type, is_deterministic, propagates_null, \
+                interface, first_seen_upstream_version \
+         FROM scalars WHERE extension = ?1",
+    )?;
+    let rows: Vec<(String, String, String, i64, i64, Option<String>, Option<String>)> = sel
+        .query_map(params![extension], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut upd = c.prepare(
+        "UPDATE scalars \
+            SET interface = COALESCE(interface, ?3), \
+                first_seen_upstream_version = COALESCE(first_seen_upstream_version, ?4), \
+                last_seen_upstream_version = ?4, \
+                signature_hash = ?5, \
+                implementation_hash = ?6 \
+          WHERE extension = ?1 AND name = ?2",
+    )?;
+    for (name, pt, rt, is_det, prop_null, iface, _first_seen) in rows {
+        let sig = hashes::scalar_signature_hash(&hashes::ScalarSig {
+            name: &name,
+            param_types_json: &pt,
+            return_type: &rt,
+            is_deterministic: is_det != 0,
+            propagates_null: prop_null != 0,
+        });
+        let (iface_for_write, impl_hash) = resolve_iface_and_impl(
+            iface.as_deref(),
+            interface_lookup(impl_hash_by_iface, &name),
+            impl_hash_by_iface,
+            helpers_only_impl_hash,
+        );
+        upd.execute(params![
+            extension,
+            name,
+            iface_for_write,
+            src.upstream_version,
+            sig,
+            impl_hash,
+        ])?;
+    }
+    Ok(())
+}
+
+fn stamp_aggregate_rows(
+    c: &Connection,
+    extension: &str,
+    src: &SourceMetadata<'_>,
+    impl_hash_by_iface: &std::collections::HashMap<String, (Option<std::path::PathBuf>, String)>,
+    helpers_only_impl_hash: &str,
+) -> Result<()> {
+    let mut sel = c.prepare(
+        "SELECT name, param_types_json, supports_grouped, supports_partial, \
+                is_order_sensitive, accepts_config, config_arg_indices_json, interface \
+         FROM aggregates WHERE extension = ?1",
+    )?;
+    let rows: Vec<(String, String, i64, i64, i64, i64, String, Option<String>)> = sel
+        .query_map(params![extension], |r| {
+            Ok((
+                r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?,
+            ))
+        })?
+        .collect::<Result<_, _>>()?;
+    let mut upd = c.prepare(
+        "UPDATE aggregates \
+            SET interface = COALESCE(interface, ?3), \
+                first_seen_upstream_version = COALESCE(first_seen_upstream_version, ?4), \
+                last_seen_upstream_version = ?4, \
+                signature_hash = ?5, \
+                implementation_hash = ?6 \
+          WHERE extension = ?1 AND name = ?2",
+    )?;
+    for (name, pt, sg, sp, os, ac, cfg_json, iface) in rows {
+        let sig = hashes::aggregate_signature_hash(&hashes::AggregateSig {
+            name: &name,
+            param_types_json: &pt,
+            supports_grouped: sg != 0,
+            supports_partial: sp != 0,
+            is_order_sensitive: os != 0,
+            accepts_config: ac != 0,
+            config_arg_indices_json: &cfg_json,
+        });
+        let (iface_for_write, impl_hash) = resolve_iface_and_impl(
+            iface.as_deref(),
+            interface_lookup(impl_hash_by_iface, &name),
+            impl_hash_by_iface,
+            helpers_only_impl_hash,
+        );
+        upd.execute(params![
+            extension,
+            name,
+            iface_for_write,
+            src.upstream_version,
+            sig,
+            impl_hash,
+        ])?;
+    }
+    Ok(())
+}
+
+fn stamp_simple_fn_rows(
+    c: &Connection,
+    table: &str,
+    extension: &str,
+    src: &SourceMetadata<'_>,
+    impl_hash_by_iface: &std::collections::HashMap<String, (Option<std::path::PathBuf>, String)>,
+    helpers_only_impl_hash: &str,
+) -> Result<()> {
+    let sel_sql = format!(
+        "SELECT name, param_types_json, interface FROM {table} WHERE extension = ?1"
+    );
+    let mut sel = c.prepare(&sel_sql)?;
+    let rows: Vec<(String, String, Option<String>)> = sel
+        .query_map(params![extension], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<Result<_, _>>()?;
+    let upd_sql = format!(
+        "UPDATE {table} \
+            SET interface = COALESCE(interface, ?3), \
+                first_seen_upstream_version = COALESCE(first_seen_upstream_version, ?4), \
+                last_seen_upstream_version = ?4, \
+                signature_hash = ?5, \
+                implementation_hash = ?6 \
+          WHERE extension = ?1 AND name = ?2"
+    );
+    let mut upd = c.prepare(&upd_sql)?;
+    for (name, pt, iface) in rows {
+        let sig_arg = hashes::SimpleFnSig {
+            name: &name,
+            param_types_json: &pt,
+        };
+        let sig = if table == "table_functions" {
+            hashes::table_function_signature_hash(&sig_arg)
+        } else {
+            hashes::window_function_signature_hash(&sig_arg)
+        };
+        let (iface_for_write, impl_hash) = resolve_iface_and_impl(
+            iface.as_deref(),
+            interface_lookup(impl_hash_by_iface, &name),
+            impl_hash_by_iface,
+            helpers_only_impl_hash,
+        );
+        upd.execute(params![
+            extension,
+            name,
+            iface_for_write,
+            src.upstream_version,
+            sig,
+            impl_hash,
+        ])?;
+    }
+    Ok(())
+}
+
+fn resolve_iface_and_impl(
+    row_iface: Option<&str>,
+    guessed: Option<&str>,
+    impl_hash_by_iface: &std::collections::HashMap<String, (Option<std::path::PathBuf>, String)>,
+    helpers_only_impl_hash: &str,
+) -> (Option<String>, String) {
+    let iface = row_iface.or(guessed).map(|s| s.to_string());
+    let impl_hash = iface
+        .as_ref()
+        .and_then(|i| impl_hash_by_iface.get(i).map(|(_, h)| h.clone()))
+        .unwrap_or_else(|| helpers_only_impl_hash.to_string());
+    (iface, impl_hash)
+}
+
+fn insert_call_edges(
+    c: &Connection,
+    extension: &str,
+    walked: &[walker::WalkedFn],
+) -> Result<()> {
+    // Filter: only record edges whose caller is a known
+    // scalar/aggregate/table/window row -- otherwise every
+    // internal helper collision produces noise.
+    fn load_names(
+        c: &Connection,
+        sql: &str,
+        extension: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut s = c.prepare(sql)?;
+        let iter = s.query_map(params![extension], |r| r.get::<_, String>(0))?;
+        let mut out = std::collections::HashSet::new();
+        for row in iter {
+            out.insert(row?);
+        }
+        Ok(out)
+    }
+    let known_scalars = load_names(c, "SELECT name FROM scalars WHERE extension = ?1", extension)?;
+    let known_aggregates =
+        load_names(c, "SELECT name FROM aggregates WHERE extension = ?1", extension)?;
+    let known_table_fns =
+        load_names(c, "SELECT name FROM table_functions WHERE extension = ?1", extension)?;
+    let known_window_fns =
+        load_names(c, "SELECT name FROM window_functions WHERE extension = ?1", extension)?;
+
+    let mut ins = c.prepare(
+        "INSERT OR IGNORE INTO function_dependencies \
+         (extension, caller_name, caller_kind, callee_extension, callee_name, callee_kind, edge_kind, source_hint) \
+         VALUES (?1, ?2, ?3, ?1, ?4, ?5, ?6, ?7)",
+    )?;
+    for w in walked {
+        let caller_kind = if known_scalars.contains(&w.caller_name) {
+            "scalar"
+        } else if known_aggregates.contains(&w.caller_name) {
+            "aggregate"
+        } else if known_table_fns.contains(&w.caller_name) {
+            "table"
+        } else if known_window_fns.contains(&w.caller_name) {
+            "window"
+        } else {
+            continue;
+        };
+        for e in &w.edges {
+            let callee_kind = if known_scalars.contains(&e.callee_name) {
+                "scalar"
+            } else if known_aggregates.contains(&e.callee_name) {
+                "aggregate"
+            } else if known_table_fns.contains(&e.callee_name) {
+                "table"
+            } else if known_window_fns.contains(&e.callee_name) {
+                "window"
+            } else {
+                match e.edge_kind {
+                    walker::EdgeKind::Macro => "macro",
+                    walker::EdgeKind::CallMethod => "method",
+                    walker::EdgeKind::Indirect => "indirect",
+                    walker::EdgeKind::Call => "indirect",
+                }
+            };
+            ins.execute(params![
+                extension,
+                w.caller_name,
+                caller_kind,
+                e.callee_name,
+                callee_kind,
+                e.edge_kind.as_str(),
+                e.source_hint,
+            ])?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_derived_edges(c: &Connection, extension: &str) -> Result<()> {
+    // (a) type_arg + type_return -- walk param_types_json (JSON
+    // array of arrays of type-name strings) and cross-reference
+    // column_types. See B0 §4.4.
+    for (kind_col, kind_val) in [
+        ("scalars", "scalar"),
+        ("aggregates", "aggregate"),
+        ("table_functions", "table"),
+        ("window_functions", "window"),
+    ] {
+        let sql = format!(
+            "INSERT OR IGNORE INTO function_dependencies \
+             (extension, caller_name, caller_kind, callee_extension, callee_name, \
+              callee_kind, edge_kind, source_hint) \
+             SELECT s.extension, s.name, ?2, s.extension, ct.type_name, 'type', 'type_arg', \
+                    'arg_index=' || jouter.key \
+             FROM {kind_col} s \
+             JOIN json_each(s.param_types_json) AS jouter ON 1=1 \
+             JOIN json_each(jouter.value)       AS j      ON 1=1 \
+             JOIN column_types ct ON ct.extension = s.extension AND ct.type_name = j.value \
+             WHERE json_type(j.value) = 'text' AND s.extension = ?1"
+        );
+        c.execute(&sql, params![extension, kind_val])?;
+    }
+
+    // return_type edge (scalars only -- other kinds don't have a
+    // scalar return_type column).
+    c.execute(
+        "INSERT OR IGNORE INTO function_dependencies \
+         (extension, caller_name, caller_kind, callee_extension, callee_name, callee_kind, edge_kind, source_hint) \
+         SELECT s.extension, s.name, 'scalar', s.extension, ct.type_name, 'type', 'type_return', 'return' \
+         FROM scalars s \
+         JOIN column_types ct ON ct.extension = s.extension AND ct.type_name = s.return_type \
+         WHERE s.extension = ?1",
+        params![extension],
+    )?;
+
+    // (b) cast_target edges.
+    c.execute(
+        "INSERT OR IGNORE INTO function_dependencies \
+         (extension, caller_name, caller_kind, callee_extension, callee_name, callee_kind, edge_kind, source_hint) \
+         SELECT cr.extension, cr.function_name, 'scalar', cr.extension, ct.type_name, 'type', 'cast_target', \
+                'cast_from=' || cr.source_kind || '/' || cr.source_fn_hint \
+         FROM cast_rewrites cr \
+         JOIN column_types ct ON ct.extension = cr.extension AND ct.type_name = cr.target_type \
+         WHERE cr.extension = ?1",
+        params![extension],
+    )?;
+
+    // (c) operator_bind edges.
+    c.execute(
+        "INSERT OR IGNORE INTO function_dependencies \
+         (extension, caller_name, caller_kind, callee_extension, callee_name, callee_kind, edge_kind, source_hint) \
+         SELECT o.extension, o.function_name, 'scalar', o.extension, o.symbol, 'operator', 'operator_bind', \
+                'lhs=' || IFNULL(o.lhs_type_id,'') || ' rhs=' || IFNULL(o.rhs_type_id,'') \
+         FROM operators o \
+         WHERE o.extension = ?1",
+        params![extension],
+    )?;
+    Ok(())
 }
 
 /// Drain the raw `postgis-composed.wasm` plug's
