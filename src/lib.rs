@@ -10,8 +10,18 @@
 //! column type / system catalog / spatial index / cast / operator /
 //! preprocessor pattern it advertises into a SQLite database.
 //!
+//! B0 (2026-07-08): schema is now `PRAGMA user_version = 2`. See
+//! [`version`] for the forward-only migration discipline: fresh
+//! opens run `SCHEMA_SQL` in one shot, existing DBs opened via
+//! [`open_or_migrate`] auto-upgrade v1 -> v2 in place.
+//!
 //! Output is a portable artifact; downstream consumers
 //! (sqlink, ducklink) read it without ever loading the wasm.
+
+pub mod migrations;
+pub mod version;
+
+pub use version::{ensure_schema, read_user_version, SCHEMA_VERSION};
 
 use std::cell::RefCell;
 use std::path::Path;
@@ -45,7 +55,9 @@ pub const SCHEMA_SQL: &str = include_str!("schema.sql");
 pub type SharedConn = Rc<RefCell<Connection>>;
 
 /// Open a database, replace any existing file, apply the schema,
-/// and return a shareable handle.
+/// and return a shareable handle. `SCHEMA_SQL` writes
+/// `PRAGMA user_version = 2` at its tail, so `ensure_schema` is
+/// invoked as a defence-in-depth check only.
 pub fn open_fresh(path: &Path) -> Result<SharedConn> {
     if path != Path::new(":memory:") && path.exists() {
         std::fs::remove_file(path)
@@ -53,6 +65,27 @@ pub fn open_fresh(path: &Path) -> Result<SharedConn> {
     }
     let conn = Connection::open(path)?;
     conn.execute_batch(SCHEMA_SQL)?;
+    ensure_schema(&conn)?;
+    Ok(Rc::new(RefCell::new(conn)))
+}
+
+/// Non-destructive open: preserve any existing content, run the
+/// forward-only migration if the DB is older than
+/// [`SCHEMA_VERSION`]. Used by long-lived tools that hold a
+/// shim-interface DB across extractions (backfill scripts,
+/// downstream catalog readers).
+pub fn open_or_migrate(path: &Path) -> Result<SharedConn> {
+    let conn = Connection::open(path)?;
+    let has_tables: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'extensions'",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_tables == 0 {
+        conn.execute_batch(SCHEMA_SQL)?;
+    } else {
+        ensure_schema(&conn)?;
+    }
     Ok(Rc::new(RefCell::new(conn)))
 }
 

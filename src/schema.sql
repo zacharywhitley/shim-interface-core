@@ -1,10 +1,24 @@
--- Schema for the shim-interface SQLite database.
+-- Schema for the shim-interface SQLite database (v2).
 --
 -- Every row's `extension` is the shim's WIT identity name
 -- (`"postgis"` / `"mobilitydb"` etc.); composite keys are
 -- `(extension, name)` so a single database can hold multiple
 -- shims side-by-side. Snapshot diffs work by ATTACHing two
 -- databases and comparing.
+--
+-- v2 (B0) additions:
+--   - `interface`, `first_seen_upstream_version`,
+--     `last_seen_upstream_version`, `deprecated_in_upstream_version`,
+--     `signature_hash`, `implementation_hash`, `status` (with default
+--     `implemented_unverified`), plus three `last_verified_*` columns
+--     and a free-form `notes` slot on the four function tables.
+--   - New tables `upstream_versions`, `function_dependencies`,
+--     `test_cases`, `test_runs` with supporting indexes.
+--   - Soft-enum triggers guarding `status` values against
+--     hand-editing.
+-- `PRAGMA user_version` is tagged to 2 at the tail so the migration
+-- code (see `shim-interface-core::migrations`) can distinguish a
+-- fresh `open_fresh` DB from a legacy v1 one that needs backfill.
 
 CREATE TABLE IF NOT EXISTS extensions (
     name TEXT PRIMARY KEY,
@@ -22,6 +36,18 @@ CREATE TABLE IF NOT EXISTS scalars (
     return_type TEXT NOT NULL,
     is_deterministic INTEGER NOT NULL,
     propagates_null INTEGER NOT NULL,
+    interface TEXT,
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    implementation_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_implementation_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     PRIMARY KEY (extension, name)
 );
 
@@ -29,13 +55,13 @@ CREATE TABLE IF NOT EXISTS scalars (
 --
 -- Doctrine note (2026-06-23 investigation): scalar shims expose
 -- aliases two ways. PostGIS uses `ScalarFunctionDef::aliases()`,
--- returning a non-empty Vec from one canonical impl — those
+-- returning a non-empty Vec from one canonical impl -- those
 -- rows land here. MobilityDB instead pushes each alias as its
 -- own canonical `(name, Kind)` dispatch-table entry; its
 -- `aliases()` returns empty, so this table is empty for that
 -- shim (all 1548 mobilitydb scalars sit in `scalars` only,
 -- including its ~275 internal aliases). Both choices are
--- correct against the trait — the difference is bookkeeping
+-- correct against the trait -- the difference is bookkeeping
 -- shape, not behavior. Tooling computing "total function
 -- names" should sum `scalars.count + scalar_aliases.count` to
 -- be fair across both shapes.
@@ -56,6 +82,18 @@ CREATE TABLE IF NOT EXISTS aggregates (
     is_order_sensitive INTEGER NOT NULL,
     accepts_config INTEGER NOT NULL,
     config_arg_indices_json TEXT NOT NULL,
+    interface TEXT,
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    implementation_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_implementation_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     PRIMARY KEY (extension, name)
 );
 
@@ -71,6 +109,18 @@ CREATE TABLE IF NOT EXISTS table_functions (
     extension TEXT NOT NULL,
     name TEXT NOT NULL,
     param_types_json TEXT NOT NULL,
+    interface TEXT,
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    implementation_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_implementation_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     PRIMARY KEY (extension, name)
 );
 
@@ -86,6 +136,18 @@ CREATE TABLE IF NOT EXISTS window_functions (
     extension TEXT NOT NULL,
     name TEXT NOT NULL,
     param_types_json TEXT NOT NULL,
+    interface TEXT,
+    first_seen_upstream_version TEXT,
+    last_seen_upstream_version TEXT,
+    deprecated_in_upstream_version TEXT,
+    signature_hash TEXT,
+    implementation_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'implemented_unverified',
+    last_verified_upstream_version TEXT,
+    last_verified_signature_hash TEXT,
+    last_verified_implementation_hash TEXT,
+    last_verified_at TEXT,
+    notes TEXT,
     PRIMARY KEY (extension, name)
 );
 
@@ -123,7 +185,7 @@ CREATE TABLE IF NOT EXISTS cast_rewrites (
     function_name TEXT NOT NULL,
     source_fn_hint TEXT NOT NULL,
     -- Extension-namespaced source-side type id (or 0 when the
-    -- source shape is not discriminated by type — e.g. bytea-fed
+    -- source shape is not discriminated by type -- e.g. bytea-fed
     -- `st_geomfromwkb` accepts any bit pattern). Populated from the
     -- WIT-side `cast-rewrite.source-type-id` field (#798).
     source_type_id INTEGER NOT NULL DEFAULT 0,
@@ -132,7 +194,7 @@ CREATE TABLE IF NOT EXISTS cast_rewrites (
     -- source_kind) key don't collide under `INSERT OR IGNORE`.
     -- PostGIS advertises many casts that discriminate by the
     -- source-side function (box2d::geometry vs. box3d::geometry,
-    -- both under `any`) — those separate via `source_fn_hint`. It
+    -- both under `any`) -- those separate via `source_fn_hint`. It
     -- also advertises identity + PostgreSQL-native + topogeom +
     -- raster rewrites that all target `geometry` under
     -- `(source_kind=any, source_fn_hint="")`; those separate via
@@ -161,13 +223,13 @@ CREATE TABLE IF NOT EXISTS system_catalog_tables (
 -- Spatial-index implementations.
 --
 -- TWO sources feed this table:
---   1. `index-plugin/index@1.0.0` — per-extension callback,
+--   1. `index-plugin/index@1.0.0` -- per-extension callback,
 --      surfaces through `ExtensionTarget::register_index_builder`.
 --      `type_id` is the WIT-declared id; `capabilities_json` is
 --      null because that interface doesn't carry capability flags.
---   2. `spatial-index-plugin/spatial-index@1.0.0` — process-
+--   2. `spatial-index-plugin/spatial-index@1.0.0` -- process-
 --      global, surfaces through `extract_spatial_index_metadata`.
---      `type_id` is 0 (sentinel — that interface doesn't expose
+--      `type_id` is 0 (sentinel -- that interface doesn't expose
 --      ids, it routes by alias); `capabilities_json` carries
 --      `{knn, within_distance, within_distance_wkb,
 --      update_after_build}` booleans.
@@ -182,6 +244,114 @@ CREATE TABLE IF NOT EXISTS spatial_indexes (
     capabilities_json TEXT,
     PRIMARY KEY (extension, name)
 );
+
+-- v2 (B0): upstream_versions -- one row per (extension, upstream release)
+-- ingested so provenance and lineage queries can trace a signature/
+-- implementation hash back to the specific tree it was extracted from.
+CREATE TABLE IF NOT EXISTS upstream_versions (
+    extension              TEXT NOT NULL,
+    version                TEXT NOT NULL,
+    released_at            TEXT,
+    ingested_at            TEXT NOT NULL,
+    ingested_from_commit   TEXT,
+    scalar_count           INTEGER,
+    aggregate_count        INTEGER,
+    table_function_count   INTEGER,
+    window_function_count  INTEGER,
+    notes                  TEXT,
+    PRIMARY KEY (extension, version),
+    FOREIGN KEY (extension) REFERENCES extensions(name)
+);
+
+-- v2 (B0): function_dependencies -- call/type/cast/operator edges
+-- between shim functions. Populated by the source walker
+-- (call/call_method/macro/indirect) and by SQL-derived queries
+-- (type_arg/type_return/cast_target/cast_source/operator_bind).
+CREATE TABLE IF NOT EXISTS function_dependencies (
+    extension          TEXT NOT NULL,
+    caller_name        TEXT NOT NULL,
+    caller_kind        TEXT NOT NULL,
+    callee_extension   TEXT NOT NULL,
+    callee_name        TEXT NOT NULL,
+    callee_kind        TEXT NOT NULL,
+    edge_kind          TEXT NOT NULL,
+    source_hint        TEXT,
+    PRIMARY KEY (extension, caller_name, callee_extension, callee_name, edge_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_fdep_callee
+    ON function_dependencies(callee_extension, callee_name);
+CREATE INDEX IF NOT EXISTS idx_fdep_caller
+    ON function_dependencies(extension, caller_name);
+
+-- v2 (B0): test_cases -- one row per stable test-case identity
+-- for a function. Populated by B1 test importers.
+CREATE TABLE IF NOT EXISTS test_cases (
+    extension       TEXT NOT NULL,
+    function_name   TEXT NOT NULL,
+    case_name       TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    source_path     TEXT,
+    sql_inline      TEXT,
+    expected        TEXT,
+    tags_json       TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (extension, function_name, case_name)
+);
+CREATE INDEX IF NOT EXISTS idx_test_cases_fn
+    ON test_cases(extension, function_name);
+
+-- v2 (B0): test_runs -- one row per test-case execution. Populated
+-- by the B2 verification harness; extractor never writes here.
+CREATE TABLE IF NOT EXISTS test_runs (
+    run_id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    extension             TEXT NOT NULL,
+    function_name         TEXT NOT NULL,
+    case_name             TEXT NOT NULL,
+    status                TEXT NOT NULL,
+    actual                TEXT,
+    duration_ms           INTEGER,
+    host_version          TEXT,
+    provider_wasm_hash    TEXT,
+    bridge_wasm_hash      TEXT,
+    upstream_version      TEXT,
+    ran_at                TEXT NOT NULL,
+    FOREIGN KEY (extension, function_name, case_name)
+        REFERENCES test_cases(extension, function_name, case_name)
+);
+CREATE INDEX IF NOT EXISTS idx_test_runs_fn_time
+    ON test_runs(function_name, ran_at DESC);
+CREATE INDEX IF NOT EXISTS idx_test_runs_status
+    ON test_runs(status, ran_at DESC);
+
+-- v2 (B0): status enum guards. SQLite lacks native ENUM but a
+-- BEFORE INSERT trigger enforcing the discriminant works for both
+-- extractor writes and hand-edits.
+CREATE TRIGGER IF NOT EXISTS trg_scalars_status_enum
+    BEFORE INSERT ON scalars
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_aggregates_status_enum
+    BEFORE INSERT ON aggregates
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_table_functions_status_enum
+    BEFORE INSERT ON table_functions
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_window_functions_status_enum
+    BEFORE INSERT ON window_functions
+    FOR EACH ROW WHEN NEW.status NOT IN
+        ('implemented_unverified','implemented_verified',
+         'deprecated','unimplemented','skip')
+    BEGIN SELECT RAISE(ABORT, 'invalid status'); END;
 
 CREATE VIEW IF NOT EXISTS extension_counts AS
 SELECT
@@ -198,3 +368,43 @@ SELECT
     (SELECT COUNT(*) FROM system_catalog_tables WHERE extension = e.name) AS system_catalog_tables,
     (SELECT COUNT(*) FROM spatial_indexes WHERE extension = e.name) AS spatial_indexes
 FROM extensions e;
+
+-- v2 (B0): rolled-up function-status counts, split by extension and
+-- function kind. Consumed by the coverage dashboards and by CI to
+-- flag drift between counts and hash-tracked verification status.
+CREATE VIEW IF NOT EXISTS function_status_summary AS
+SELECT extension, 'scalar' AS kind, status, COUNT(*) AS n
+    FROM scalars           GROUP BY extension, status
+UNION ALL
+SELECT extension, 'aggregate',       status, COUNT(*)
+    FROM aggregates        GROUP BY extension, status
+UNION ALL
+SELECT extension, 'table_function',  status, COUNT(*)
+    FROM table_functions   GROUP BY extension, status
+UNION ALL
+SELECT extension, 'window_function', status, COUNT(*)
+    FROM window_functions  GROUP BY extension, status;
+
+-- v2 (B0): "if this function/type/operator changes, which SQL
+-- functions could ripple?" -- WITH RECURSIVE reverse closure over
+-- function_dependencies, cycle-guarded at depth 16 (empirically 4x
+-- the max chain length observed in the postgis shim's Self:: cycles).
+CREATE VIEW IF NOT EXISTS function_reverse_transitive AS
+WITH RECURSIVE
+    rev(root_extension, root_callee, extension, caller_name, depth) AS (
+        SELECT callee_extension, callee_name, extension, caller_name, 1
+            FROM function_dependencies
+        UNION
+        SELECT r.root_extension, r.root_callee,
+               fd.extension, fd.caller_name, r.depth + 1
+            FROM function_dependencies fd
+            JOIN rev r
+              ON fd.callee_extension = r.extension
+             AND fd.callee_name      = r.caller_name
+            WHERE r.depth < 16
+    )
+SELECT root_extension, root_callee, extension, caller_name, MIN(depth) AS depth
+    FROM rev
+    GROUP BY root_extension, root_callee, extension, caller_name;
+
+PRAGMA user_version = 2;
