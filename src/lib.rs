@@ -598,7 +598,7 @@ fn insert_derived_edges(c: &Connection, extension: &str) -> Result<()> {
              JOIN json_each(s.param_types_json) AS jouter ON 1=1 \
              JOIN json_each(jouter.value)       AS j      ON 1=1 \
              JOIN column_types ct ON ct.extension = s.extension AND ct.type_name = j.value \
-             WHERE json_type(j.value) = 'text' AND s.extension = ?1"
+             WHERE j.type = 'text' AND s.extension = ?1"
         );
         c.execute(&sql, params![extension, kind_val])?;
     }

@@ -107,15 +107,34 @@ pub fn walk_shim_src(src_root: &Path) -> Result<Vec<WalkedFn>> {
             .and_then(|s| s.to_str())
             .unwrap_or("<unknown>")
             .to_string();
-        for item in &file.items {
-            match item {
-                syn::Item::Impl(im) => visit_impl(im, &module, &helper_idents, &mut out),
-                syn::Item::Fn(fnd) => visit_free_fn(fnd, &module, &helper_idents, &mut out),
-                _ => {}
-            }
-        }
+        walk_items(&file.items, &module, &helper_idents, &mut out);
     }
     Ok(out)
+}
+
+fn walk_items(
+    items: &[syn::Item],
+    module: &str,
+    helpers: &BTreeSet<String>,
+    out: &mut Vec<WalkedFn>,
+) {
+    for item in items {
+        match item {
+            syn::Item::Impl(im) => visit_impl(im, module, helpers, out),
+            syn::Item::Fn(fnd) => visit_free_fn(fnd, module, helpers, out),
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    // Preserve the top-level file stem as the module
+                    // label -- nested `mod wasm { ... }` blocks (used
+                    // by cfg-gated shim source trees like mobilitydb)
+                    // should still be attributed to the file they
+                    // live in.
+                    walk_items(inner, module, helpers, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn visit_impl(
