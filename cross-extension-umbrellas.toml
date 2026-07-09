@@ -6,7 +6,7 @@
 # `leaves.toml` and per-extension umbrellas; this file owns the
 # umbrellas whose `expands_to` set reaches into multiple
 # extensions and therefore cannot be validated in isolation by
-# the per-extension `spatial-catalog-emit` binary.
+# the per-extension `sql-extension-catalog-emit` binary.
 #
 # Schema
 # ------
@@ -24,22 +24,22 @@
 #
 # Consumption
 # -----------
-# The single-extension `spatial-catalog-emit` binary does not read
-# this file directly — it owns exactly one `spatial-catalog.toml`
-# by design. Per-extension `leaves.toml` files may declare
-# cross-extension deps of the form `<namespace>:<leaf-id>` and
-# reference sibling catalogs at emit time via the emitter's
-# `--sibling-catalog <path>` flag; the emitter validates every
-# `<namespace>:<leaf-id>` reference against the sibling set and
-# fails hard on unresolved refs (see the Phase 0-F review that
-# introduced this check).
+# The single-extension `sql-extension-catalog-emit` binary does
+# not read this file directly — it owns exactly one
+# `<extension>-catalog.toml` by design. Per-extension
+# `leaves.toml` files may declare cross-extension deps of the
+# form `<namespace>:<leaf-id>` and reference sibling catalogs at
+# emit time via the emitter's `--sibling-catalog <path>` flag;
+# the emitter validates every `<namespace>:<leaf-id>` reference
+# against the sibling set and fails hard on unresolved refs
+# (see the Phase 0-F review that introduced this check).
 #
 # The `expands_to` entries in this file — cross-extension
-# umbrellas that span PostGIS *and* MobilityDB leaves — remain
-# outside the single-extension pipeline. A future multi-catalog
-# consumer will merge per-extension `spatial-catalog.toml` outputs
-# with the umbrellas defined here and expose them under a unified
-# discovery namespace.
+# umbrellas that span PostGIS, MobilityDB, and TimescaleDB
+# leaves — remain outside the single-extension pipeline. A
+# future multi-catalog consumer will merge per-extension
+# `<extension>-catalog.toml` outputs with the umbrellas defined
+# here and expose them under a unified discovery namespace.
 #
 # Rationale (why this file, not tool changes or duplication)
 # ---------------------------------------------------------
@@ -98,3 +98,69 @@ expands_to  = [
     "mobilitydb:mobilitydb_bitemporal",
     "mobilitydb:mobilitydb_temporal_jsonb",
 ]
+
+# ----- Capability axis (TimescaleDB additions) -----
+
+[[umbrella]]
+id          = "temporal"
+extension   = "cross"
+kind        = "capability"
+expands_to  = [
+    "mobilitydb:mobilitydb_temporal_core",
+    "timescaledb:timescale_core",
+    "timescaledb:timescale_hypertable_mgmt",
+    "timescaledb:timescale_toolkit_stats",
+]
+description = "Non-spatial temporal surface — MobilityDB temporal types + TimescaleDB time-series primitives + hypertable mgmt + counter/gauge stats."
+
+[[umbrella]]
+id          = "time-series-spatial"
+extension   = "cross"
+kind        = "capability"
+expands_to  = [
+    "postgis:spatio",
+    "timescaledb:timescale_core",
+    "timescaledb:timescale_hypertable_mgmt",
+]
+description = "Static geometry over time-series — PostGIS 2D vector + TimescaleDB hypertables. No moving objects."
+
+[[umbrella]]
+id          = "time-series-spatiotemporal"
+extension   = "cross"
+kind        = "capability"
+expands_to  = [
+    "postgis:spatio",
+    "mobilitydb:mobilitydb_temporal_core",
+    "mobilitydb:mobilitydb_spatiotemporal_core",
+    "mobilitydb:temporal-analysis",
+    "timescaledb:timescale_core",
+    "timescaledb:timescale_hypertable_mgmt",
+]
+description = "Three-way union: PostGIS geometry + MobilityDB moving objects + TimescaleDB hypertables. Superset of `spatiotemporal`."
+
+# ----- Task axis (TimescaleDB additions) -----
+
+[[umbrella]]
+id          = "mobility-tracking"
+extension   = "cross"
+kind        = "task"
+expands_to  = [
+    "postgis:spatio",
+    "mobilitydb:mobilitydb_temporal_core",
+    "mobilitydb:mobilitydb_spatiotemporal_core",
+    "mobilitydb:temporal-analysis",
+    "mobilitydb:mobilitydb_spatial_analysis",
+    "timescaledb:timescale_hypertable",
+    "timescaledb:timescale_continuous_agg",
+    "timescaledb:timescale_policy",
+]
+description = "Live fleet/trajectory tracking — spatiotemporal + hypertables + continuous aggregates + retention."
+
+# ----- Backwards-compat aliases (TimescaleDB) -----
+
+[[umbrella]]
+id          = "timescaledb"
+extension   = "cross"
+kind        = "compat"
+expands_to  = [ "timescaledb:timescaledb" ]
+description = "Cross-ext alias — TimescaleDB has no cross-ext deps, so this delegates directly to the per-ext `timescaledb` compat umbrella."
