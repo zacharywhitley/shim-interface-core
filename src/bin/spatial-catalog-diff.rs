@@ -28,6 +28,7 @@
 //!   * PATCH when nothing changed.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -55,10 +56,28 @@ struct Cli {
     #[arg(long)]
     after: PathBuf,
 
-    /// Emit `text` (human-friendly summary) or `json` (structured
-    /// delta for the cascade orchestrator).
-    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
-    output_format: OutputFormat,
+    /// Emit `text` (human-friendly summary), `json` (structured
+    /// delta for the cascade orchestrator), or `both` (single-shot
+    /// dual emission — requires `--text-out` and `--json-out`).
+    ///
+    /// When omitted, the effective format is inferred from the
+    /// `--text-out` / `--json-out` flags: both set → `both`, one
+    /// set → the matching single format, neither set → `text`
+    /// (streamed to stdout — the historical default).
+    #[arg(long, value_enum)]
+    output_format: Option<OutputFormat>,
+
+    /// Write the human-friendly text report to this file instead
+    /// of stdout. When set and `--output-format` is not, the
+    /// effective format includes text.
+    #[arg(long)]
+    text_out: Option<PathBuf>,
+
+    /// Write the structured JSON delta to this file instead of
+    /// stdout. When set and `--output-format` is not, the
+    /// effective format includes json.
+    #[arg(long)]
+    json_out: Option<PathBuf>,
 
     /// Comma-separated subset of families to report.  When empty
     /// (the default) every family is included.  Accepted names
@@ -72,11 +91,12 @@ struct Cli {
     entity_filter: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 enum OutputFormat {
     Text,
     Json,
+    Both,
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,42 +1071,51 @@ fn build_report(
 /// the task spec of "first 20".
 const SAMPLE_LIMIT: usize = 20;
 
-fn print_text(report: &Report) {
-    println!(
+/// Render the human-facing text report into a `String`. The main
+/// loop routes the result to stdout or to `--text-out` — keeping
+/// the formatter side-effect-free lets `--output-format=both`
+/// atomically write both artifacts (or fail without a partial
+/// stdout dump).
+fn format_text(report: &Report) -> String {
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
         "Comparing {} (before) vs {} (after):",
         report.before.label, report.after.label,
     );
     if let (Some(bv), Some(av)) = (report.before.schema_version, report.after.schema_version) {
-        println!("  schema: v{} (before) vs v{} (after)", bv, av);
+        let _ = writeln!(out, "  schema: v{} (before) vs v{} (after)", bv, av);
     }
-    println!();
+    let _ = writeln!(out);
 
     for delta in &report.families {
-        print_family_text(delta);
+        format_family_text(&mut out, delta);
     }
 
     if !report.warnings.is_empty() {
-        println!();
+        let _ = writeln!(out);
         for w in &report.warnings {
-            println!("WARNING: {w}");
+            let _ = writeln!(out, "WARNING: {w}");
         }
     }
 
-    println!();
-    println!(
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
         "SEMVER classification: {} ({})",
         report.semver.class.label(),
         report.semver.reason
     );
     if !report.human_gate.is_empty() {
-        println!("Human gate:");
+        let _ = writeln!(out, "Human gate:");
         for h in &report.human_gate {
-            println!("  - {h}");
+            let _ = writeln!(out, "  - {h}");
         }
     }
+    out
 }
 
-fn print_family_text(d: &FamilyDelta) {
+fn format_family_text(out: &mut String, d: &FamilyDelta) {
     let label = Family::parse_slug(d.family)
         .map(|f| f.label())
         .unwrap_or(d.family);
@@ -1095,7 +1124,8 @@ fn print_family_text(d: &FamilyDelta) {
     let n_sig = d.signature_changed.len();
     let n_unc = d.unchanged;
 
-    println!(
+    let _ = writeln!(
+        out,
         "{}: +{} -{} ~{} = {} unchanged",
         label, n_add, n_rem, n_sig, n_unc
     );
@@ -1108,7 +1138,8 @@ fn print_family_text(d: &FamilyDelta) {
             .take(SAMPLE_LIMIT)
             .map(|e| e.display.clone())
             .collect();
-        println!(
+        let _ = writeln!(
+            out,
             "  +{n_add} added:  {}{}",
             sample.join(", "),
             if n_add > SAMPLE_LIMIT {
@@ -1125,7 +1156,8 @@ fn print_family_text(d: &FamilyDelta) {
             .take(SAMPLE_LIMIT)
             .map(|e| e.display.clone())
             .collect();
-        println!(
+        let _ = writeln!(
+            out,
             "  -{n_rem} removed:  {}{}",
             sample.join(", "),
             if n_rem > SAMPLE_LIMIT {
@@ -1142,7 +1174,8 @@ fn print_family_text(d: &FamilyDelta) {
             .take(SAMPLE_LIMIT)
             .map(|s| s.display.clone())
             .collect();
-        println!(
+        let _ = writeln!(
+            out,
             "  ~{n_sig} signature-changed:  {}{}",
             sample.join(", "),
             if n_sig > SAMPLE_LIMIT {
@@ -1154,7 +1187,7 @@ fn print_family_text(d: &FamilyDelta) {
     }
     if d.hash_compare_skipped {
         if let Some(reason) = &d.skip_reason {
-            println!("  ! hash-level compare skipped: {reason}");
+            let _ = writeln!(out, "  ! hash-level compare skipped: {reason}");
         }
     }
 }
@@ -1185,12 +1218,61 @@ fn main() -> Result<()> {
 
     let report = build_report(&before, &after, &filter);
 
-    match cli.output_format {
-        OutputFormat::Text => print_text(&report),
-        OutputFormat::Json => {
-            let out = serde_json::to_string_pretty(&report)
-                .context("serialising JSON report")?;
-            println!("{}", out);
+    // Resolve the effective output format from `--output-format`
+    // plus the `--text-out` / `--json-out` implication rules.
+    // When the user doesn't pass `--output-format`, having both
+    // output paths set means "both formats" (single-shot dual
+    // emission, exactly what bump-upstream's `step_diff` wants).
+    let effective = match cli.output_format {
+        Some(fmt) => fmt,
+        None => match (cli.text_out.is_some(), cli.json_out.is_some()) {
+            (true, true) => OutputFormat::Both,
+            (true, false) => OutputFormat::Text,
+            (false, true) => OutputFormat::Json,
+            (false, false) => OutputFormat::Text,
+        },
+    };
+
+    // `both` needs somewhere to put each stream — otherwise text
+    // and JSON would both fight for stdout. Fail early rather
+    // than emit a garbled mix.
+    if effective == OutputFormat::Both
+        && (cli.text_out.is_none() || cli.json_out.is_none())
+    {
+        bail!(
+            "--output-format=both requires both --text-out and --json-out \
+             (stdout cannot carry two formats simultaneously)"
+        );
+    }
+
+    let want_text = matches!(effective, OutputFormat::Text | OutputFormat::Both);
+    let want_json = matches!(effective, OutputFormat::Json | OutputFormat::Both);
+
+    // Render both artifacts first, then commit them — an error in
+    // either serialisation aborts before anything reaches disk or
+    // stdout, matching the atomic contract cascade steps expect.
+    let text_body = if want_text { Some(format_text(&report)) } else { None };
+    let json_body = if want_json {
+        Some(
+            serde_json::to_string_pretty(&report)
+                .context("serialising JSON report")?,
+        )
+    } else {
+        None
+    };
+
+    if let Some(body) = text_body {
+        match &cli.text_out {
+            Some(path) => fs::write(path, &body)
+                .with_context(|| format!("writing text report to {}", path.display()))?,
+            None => print!("{}", body),
+        }
+    }
+    if let Some(body) = json_body {
+        match &cli.json_out {
+            Some(path) => fs::write(path, &body)
+                .with_context(|| format!("writing JSON delta to {}", path.display()))?,
+            None => println!("{}", body),
         }
     }
 
