@@ -128,6 +128,12 @@ CREATE TABLE IF NOT EXISTS table_functions (
     extension TEXT NOT NULL,
     name TEXT NOT NULL,
     param_types_json TEXT NOT NULL,
+    -- JSON array of [column_name, type_token] pairs describing the
+    -- output row schema (e.g. `[["timestamp","int64"],["value","float64"]]`).
+    -- Populated at extraction time from TableFunctionDef::output_schema.
+    -- Optional for backward-compat with pre-B5 extractions; downstream
+    -- codegen falls back to a single `result BLOB` column when NULL.
+    output_columns_json TEXT,
     interface TEXT,
     first_seen_upstream_version TEXT,
     last_seen_upstream_version TEXT,

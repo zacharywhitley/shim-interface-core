@@ -955,10 +955,34 @@ impl ExtensionTarget for SqliteExtensionTarget {
         )
         .unwrap_or_else(|_| "[]".into());
         let name = def.name().to_string();
+        // Sample the output schema with the declared parameter types
+        // (or an empty slice if the shim doesn't advertise any). Most
+        // shim UDTFs return a fixed schema regardless of input types;
+        // the ones that don't will still return SOMETHING plausible
+        // for downstream codegen to emit against.
+        let sample_input: Vec<_> = def
+            .param_types()
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let output_columns_json = {
+            let cols = def.output_schema(&sample_input);
+            let rows: Vec<[String; 2]> = cols
+                .iter()
+                .map(|c| {
+                    [
+                        c.name.to_string(),
+                        format!("{:?}", c.data_type).to_lowercase(),
+                    ]
+                })
+                .collect();
+            serde_json::to_string(&rows).unwrap_or_else(|_| "[]".into())
+        };
         let _ = self.conn.borrow().execute(
-            "INSERT OR IGNORE INTO table_functions (extension, name, param_types_json) \
-             VALUES (?1, ?2, ?3)",
-            params![self.extension, name, pt],
+            "INSERT OR IGNORE INTO table_functions \
+                (extension, name, param_types_json, output_columns_json) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![self.extension, name, pt, output_columns_json],
         );
         for alias in def.aliases() {
             let _ = self.conn.borrow().execute(
